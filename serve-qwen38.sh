@@ -67,6 +67,22 @@ load_env() {
   # and hard-failed. The gap between CLIENT_CTX_SIZE and CTX_SIZE is the
   # safety margin that absorbs that slop.
   CLIENT_CTX_SIZE="${CLIENT_CTX_SIZE:-57344}"
+  # These three cap how much a SINGLE turn can grow the conversation, which
+  # matters more than CLIENT_CTX_SIZE's margin does: confirmed by hand that
+  # a single turn (many fanned-out tool calls) can add tens of thousands of
+  # tokens in one shot — qwen-code's per-call truncateToolOutputThreshold
+  # (25000 chars stock) still lets a *batch* of several truncated calls add
+  # up to more than the CLIENT_CTX_SIZE margin before compaction ever runs.
+  # sessionTokenLimit is a deterministic backstop that doesn't depend on
+  # qwen-code's (proven-unreliable) token-count estimation at all — it
+  # blocks sending the next message outright once the recorded prompt
+  # count is already over the limit, rather than sending and hard-failing
+  # server-side. NOT applied via context-shift server-side (deliberately
+  # rejected — see README: recurrent/hybrid memory can't be partially
+  # truncated, risking corruption, not just a performance hit).
+  QWEN_TOOL_OUTPUT_THRESHOLD="${QWEN_TOOL_OUTPUT_THRESHOLD:-8000}"
+  QWEN_TOOL_OUTPUT_LINES="${QWEN_TOOL_OUTPUT_LINES:-300}"
+  QWEN_SESSION_TOKEN_LIMIT="${QWEN_SESSION_TOKEN_LIMIT:-50000}"
   UBATCH_SIZE="${UBATCH_SIZE:-8192}"
   BATCH_SIZE="${BATCH_SIZE:-8192}"
   PARALLEL="${PARALLEL:-1}"
@@ -554,6 +570,9 @@ EOF
     --arg provider_name "Qwen3.8-27B (gfx1151 llama.cpp/HIP)" \
     --arg model_name "$SERVED_MODEL_NAME" \
     --argjson ctx_size "$CLIENT_CTX_SIZE" \
+    --argjson tool_output_threshold "$QWEN_TOOL_OUTPUT_THRESHOLD" \
+    --argjson tool_output_lines "$QWEN_TOOL_OUTPUT_LINES" \
+    --argjson session_token_limit "$QWEN_SESSION_TOKEN_LIMIT" \
     '
     .env[$env_key] = $api_key
     | .modelProviders.openai = ((.modelProviders.openai // []) | map(select(.id != $provider_id)) + [{
@@ -567,10 +586,14 @@ EOF
       }])
     | .security.auth = { baseUrl: $base_url, selectedType: "openai" }
     | .model.name = $model_name
+    | .tools.truncateToolOutputThreshold = $tool_output_threshold
+    | .tools.truncateToolOutputLines = $tool_output_lines
+    | .model.sessionTokenLimit = $session_token_limit
     ' <<<"$existing")" || die "jq failed to update $settings_path — check it's valid JSON."
 
   printf '%s\n' "$updated" > "$settings_path"
   log "Updated $settings_path: default provider now this server ($base_url)."
+  log "Also lowered tools.truncateToolOutputThreshold/Lines and set model.sessionTokenLimit (see README) — these are global settings, not just for this provider. Requires a fresh 'qwen' session (not just a retry) to take effect."
 
   cat <<EOF
 

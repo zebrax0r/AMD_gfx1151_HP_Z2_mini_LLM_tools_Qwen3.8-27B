@@ -61,8 +61,25 @@ CTX_SIZE="73728"
 # jump past its compaction trigger before compaction runs. Confirmed by
 # hand: reporting the exact CTX_SIZE (65536 at the time) still overshot to
 # 68046 tokens and hard-failed. Keep this comfortably below CTX_SIZE —
-# the gap is the safety margin.
+# the gap is the safety margin. NOTE: even a 16K-token margin was fully
+# blown through in one turn (see QWEN_TOOL_OUTPUT_THRESHOLD below for the
+# fix that actually addresses the root cause, not just this symptom).
 CLIENT_CTX_SIZE="57344"
+
+# QWEN_TOOL_OUTPUT_THRESHOLD / QWEN_TOOL_OUTPUT_LINES / QWEN_SESSION_TOKEN_LIMIT:
+# written into qwen-code's global settings.json (tools.truncateToolOutputThreshold/
+# Lines, model.sessionTokenLimit) by wire-qwen-code. Confirmed by hand: the
+# CLIENT_CTX_SIZE margin above got fully consumed in a single turn because
+# qwen-code's stock per-call tool-output truncation (25000 chars) still lets
+# a *batch* of several fanned-out tool calls add up to far more than that.
+# Lowering the per-call cap bounds how much a single turn can add; sessionTokenLimit
+# is a deterministic backstop that blocks sending the next message outright
+# once the recorded prompt is already over budget, independent of qwen-code's
+# (unreliable) token-count estimation. Requires a fresh `qwen` session to
+# take effect, not just a retry.
+QWEN_TOOL_OUTPUT_THRESHOLD="8000"
+QWEN_TOOL_OUTPUT_LINES="300"
+QWEN_SESSION_TOKEN_LIMIT="50000"
 
 # UBATCH_SIZE / BATCH_SIZE: mitigate llama.cpp#28211 (prompts longer than
 # n_ubatch get SILENTLY WRONG logits on HIP/gfx1151 — no crash, just bad

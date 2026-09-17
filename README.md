@@ -178,10 +178,36 @@ reported exactly, a real session still overshot to 68046 tokens and
 hard-failed, because `qwen-code`'s own token counts are estimates and a
 single large step can jump past its compaction trigger before compaction
 runs. `CLIENT_CTX_SIZE` is deliberately lower than `CTX_SIZE` (currently
-57344 vs. 73728) — the gap is the safety margin. If you change either
-value, rerun `wire-qwen-code` (on every machine running `qwen-code`
-against this server, laptops included) so the client's number stays in
-sync.
+57344 vs. 73728) — the gap is the safety margin.
+
+**Even that margin isn't fully reliable** — confirmed directly a second
+time: a 16,384-token margin was completely consumed in one turn (74602
+tokens sent, 874 over the real hard `CTX_SIZE`). `qwen-code`'s proactive
+compaction doesn't reliably trigger before a single large-enough addition.
+So `wire-qwen-code` also sets three more (global, not provider-specific)
+`settings.json` fields: `tools.truncateToolOutputThreshold` and
+`tools.truncateToolOutputLines` (lowered from qwen-code's stock 25,000
+chars / 1,000 lines to 8,000 / 300 — this bounds how much a single tool
+call can add; the stock default still let a *batch* of several fanned-out
+tool calls add up to more than the whole `CLIENT_CTX_SIZE` margin), and
+`model.sessionTokenLimit` (50,000 — a deterministic backstop that blocks
+sending the next message outright once the recorded prompt is already over
+budget, independent of token-count estimation entirely). These require a
+fresh `qwen` session to take effect, not just a Ctrl+Y retry.
+
+We deliberately did **not** reach for llama-server's `--context-shift`
+here, even though it's designed for exactly this (discard old context
+instead of hard-failing). Its discard mechanism needs to partially
+truncate the KV cache, but this model's Gated-DeltaNet recurrent-state
+layers can't be partially truncated the way normal attention KV cache
+can — real-world reports describe resulting position-accounting desync on
+hybrid/recurrent architectures, not just a performance hit. The risk is
+silent corruption, so the fix has to live client-side instead.
+
+If you change `CTX_SIZE`, `CLIENT_CTX_SIZE`, `QWEN_TOOL_OUTPUT_THRESHOLD`,
+`QWEN_TOOL_OUTPUT_LINES`, or `QWEN_SESSION_TOKEN_LIMIT`, rerun
+`wire-qwen-code` (on every machine running `qwen-code` against this
+server, laptops included) so the client's config stays in sync.
 
 ## Client-only setup (a laptop or other machine that doesn't run the server)
 
