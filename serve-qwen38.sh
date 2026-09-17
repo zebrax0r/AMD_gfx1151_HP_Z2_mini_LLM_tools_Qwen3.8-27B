@@ -57,7 +57,16 @@ load_env() {
   # `build`/`serve`) so `wire-qwen-code` and the `serve` banner print the
   # right address for that machine to use.
   SERVER_HOST="${SERVER_HOST:-127.0.0.1}"
-  CTX_SIZE="${CTX_SIZE:-65536}"
+  CTX_SIZE="${CTX_SIZE:-73728}"
+  # CLIENT_CTX_SIZE is what we tell qwen-code via generationConfig.
+  # contextWindowSize — deliberately LOWER than CTX_SIZE. qwen-code's own
+  # token counts are estimates (its debug log literally logs
+  # `estimated=true`), and a single large step (e.g. one big tool result)
+  # can jump past its compaction trigger before compaction runs. Confirmed
+  # by hand: reporting the exact CTX_SIZE (65536) still overshot to 68046
+  # and hard-failed. The gap between CLIENT_CTX_SIZE and CTX_SIZE is the
+  # safety margin that absorbs that slop.
+  CLIENT_CTX_SIZE="${CLIENT_CTX_SIZE:-57344}"
   UBATCH_SIZE="${UBATCH_SIZE:-8192}"
   BATCH_SIZE="${BATCH_SIZE:-8192}"
   PARALLEL="${PARALLEL:-1}"
@@ -372,7 +381,7 @@ cmd_serve() {
  Qwen3.8-27B is up.
    Base URL:    ${display_url}/v1
    Model alias: ${SERVED_MODEL_NAME}
-   Ctx size:    ${CTX_SIZE}   Ubatch: ${UBATCH_SIZE}   Parallel: ${PARALLEL}
+   Ctx size:    ${CTX_SIZE} (qwen-code told: ${CLIENT_CTX_SIZE})   Ubatch: ${UBATCH_SIZE}   Parallel: ${PARALLEL}
    Expect roughly ~7-12 tok/s (llama.cpp#20354, gfx1151 hybrid GDN kernel
    ties CPU-fallback speed). See README for details.
 $( [[ "$SERVER_HOST" == "127.0.0.1" ]] && echo "   (SERVER_HOST is 127.0.0.1 — set it to this box's LAN IP in qwen38.env if other machines need to reach this server.)" )
@@ -521,12 +530,16 @@ EOF
     existing="$(cat "$settings_path")"
   fi
 
-  # generationConfig.contextWindowSize tells qwen-code our real ceiling.
-  # Without it, qwen-code defaults to assuming ~1,000,000 tokens (Qwen3.8's
+  [[ "$CLIENT_CTX_SIZE" -lt "$CTX_SIZE" ]] || warn "CLIENT_CTX_SIZE ($CLIENT_CTX_SIZE) is not lower than CTX_SIZE ($CTX_SIZE) — this removes qwen-code's safety margin and it will likely overshoot into a hard 400 again."
+
+  # generationConfig.contextWindowSize tells qwen-code our ceiling.
+  # Deliberately CLIENT_CTX_SIZE (lower than the real CTX_SIZE), not
+  # CTX_SIZE itself — see the CLIENT_CTX_SIZE comment in load_env for why:
+  # qwen-code's token counts are estimates, and reporting the exact real
+  # limit still overshot into a hard 400 in practice. Without this field at
+  # all, qwen-code defaults to assuming ~1,000,000 tokens (Qwen3.8's
   # advertised native/YaRN context) and paces its own auto-compaction
-  # against that instead of what this server can actually serve — meaning
-  # it grows the conversation until it hits a hard 400 "exceeds context
-  # size" error instead of compacting proactively. Confirmed by hand: this
+  # against that instead of what this server can actually serve. This
   # field is documented in qwen-code's own model-providers.md and is an
   # "impermeable layer" that fully replaces generationConfig for this
   # provider entry (per-field settings-level values are NOT inherited).
@@ -540,7 +553,7 @@ EOF
     --arg provider_id "$provider_id" \
     --arg provider_name "Qwen3.8-27B (gfx1151 llama.cpp/HIP)" \
     --arg model_name "$SERVED_MODEL_NAME" \
-    --argjson ctx_size "$CTX_SIZE" \
+    --argjson ctx_size "$CLIENT_CTX_SIZE" \
     '
     .env[$env_key] = $api_key
     | .modelProviders.openai = ((.modelProviders.openai // []) | map(select(.id != $provider_id)) + [{

@@ -79,12 +79,15 @@ fail unexpectedly.
 
 ## `[API Error: 400 request (N tokens) exceeds the available context size (CTX_SIZE tokens)]`
 
-Two layers to this:
+Three layers to this, in the order they were actually discovered:
 
-1. **Immediate fix**: raise `CTX_SIZE` in `qwen38.env` and `./serve-qwen38.sh restart`. Stay well clear of ~80K (llama.cpp#27623 — see the known-bugs table); 65536 is the current default with room to spare.
-2. **Root cause**: `qwen-code` doesn't know this server's real `CTX_SIZE` unless its provider entry in `settings.json` sets `generationConfig.contextWindowSize` to match. Without it, `qwen-code` assumes the model's advertised ~1,000,000-token context and won't proactively compact the conversation — it just keeps growing until the server hard-rejects the request. `./serve-qwen38.sh wire-qwen-code` sets this field automatically; rerun it after changing `CTX_SIZE`, and on every other machine (laptops included) that points `qwen-code` at this server.
+1. **Naive fix (insufficient on its own)**: raise `CTX_SIZE` in `qwen38.env` and `./serve-qwen38.sh restart`. Stay well clear of ~80K (llama.cpp#27623 — see the known-bugs table).
+2. **`qwen-code` needs to know the ceiling**: it doesn't know this server's real `CTX_SIZE` unless its provider entry in `settings.json` sets `generationConfig.contextWindowSize`. Without it, `qwen-code` assumes the model's advertised ~1,000,000-token context and won't proactively compact — it just keeps growing until the server hard-rejects the request.
+3. **Telling it the *exact* ceiling still isn't enough**: confirmed directly — reporting `contextWindowSize` equal to the real `CTX_SIZE` (65536) still overshot to 68046 tokens and hard-failed anyway. `qwen-code`'s own token counts are estimates (`estimated=true` in its debug log), and a single large step (one big tool result, a large file read) can jump past its compaction trigger before compaction gets a chance to run.
 
-If it recurs even with `contextWindowSize` set correctly, that's a signal the session's genuine history has grown past a comfortable working set for this hardware — starting a fresh `qwen` session is more sustainable than continuing to raise `CTX_SIZE` toward the decode-collapse threshold.
+The actual fix is **`CLIENT_CTX_SIZE`**, a separate, deliberately-smaller number than `CTX_SIZE`: the server enforces `CTX_SIZE` (currently 73728), but `wire-qwen-code` tells `qwen-code` a lower `CLIENT_CTX_SIZE` (currently 57344) via `contextWindowSize`. The gap between them is the safety margin that absorbs the estimation slop. `./serve-qwen38.sh wire-qwen-code` writes this automatically; rerun it after changing either value, and on every other machine (laptops included) that points `qwen-code` at this server.
+
+If it recurs even with this margin in place, that's a signal the session's genuine history has grown past a comfortable working set for this hardware — starting a fresh `qwen` session is more sustainable than continuing to raise the ceiling toward the decode-collapse threshold.
 
 ## `qwen-code` seems to hang / doesn't respond for a long time
 

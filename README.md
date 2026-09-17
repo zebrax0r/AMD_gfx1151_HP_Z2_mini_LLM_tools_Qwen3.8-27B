@@ -36,7 +36,7 @@ periodically as fixes land upstream.
 | Issue | Symptom | This repo's mitigation |
 |---|---|---|
 | [llama.cpp#28211](https://github.com/ggml-org/llama.cpp/issues/28211) | HIP/gfx1151: prompts longer than `n_ubatch` get **silently wrong logits** (no crash) | `UBATCH_SIZE`/`BATCH_SIZE` default to 8192 (vs stock 512) — raises the ceiling, does not fix the bug |
-| [llama.cpp#27623](https://github.com/ggml-org/llama.cpp/issues/27623) | Decode throughput collapses ~25x once KV position exceeds ~80K tokens | `CTX_SIZE` defaults to 65536 (raised from an initial 32768 — too tight for real `qwen-code` sessions, see below); `serve` warns if you raise it above 81920 |
+| [llama.cpp#27623](https://github.com/ggml-org/llama.cpp/issues/27623) | Decode throughput collapses ~25x once KV position exceeds ~80K tokens | `CTX_SIZE` defaults to 73728 (raised from 32768, then 65536 — both too tight for real `qwen-code` sessions, see below); `serve` warns if you raise it above 81920 |
 | [llama.cpp#20354](https://github.com/ggml-org/llama.cpp/issues/20354) | Gated-DeltaNet fused kernel runs on GPU on gfx1151 but performs no better than CPU fallback | None possible — this is a performance ceiling, not a correctness bug. Expect **~12 tokens/sec**, not MI210-class numbers |
 | [llama.cpp#24437](https://github.com/ggml-org/llama.cpp/issues/24437) | `GGML_HIP_ROCWMMA_FATTN=ON` causes up to -41% prefill throughput on gfx1151 at 8K+ context, worsening with context length | Build compiles this flag **OFF** — a deliberate divergence from some "known-good Strix Halo" community recipes that set it ON |
 | [lemonade-sdk#3160](https://github.com/lemonade-sdk/lemonade/issues/3160) | Progressive generation corruption under sustained/concurrent load on ROCm-nightly gfx1151, recovers only on full reload | `PARALLEL=1` (single-slot serving) by default; use `restart` if output degrades, or `install-watchdog` for automated selftest-gated restarts |
@@ -164,17 +164,24 @@ providers already configured (e.g. a separate Ollama-based setup — this
 box already had one, on port 11434, discovered while building this repo),
 and sets that entry as the default (`security.auth`). Safe to rerun.
 
-It also writes `generationConfig.contextWindowSize: $CTX_SIZE` into that
-provider entry. This matters more than it looks: without it, `qwen-code`
-assumes the model's *advertised* context (Qwen3.8's ~1,000,000-token
-YaRN-extended native context) rather than what this server is actually
-configured to serve, and paces its own auto-compaction against that wrong
-number — meaning it keeps growing the conversation until it hits a hard
-`400 ... exceeds the available context size` error instead of compacting
-proactively. Confirmed directly: this recurred at both 32768 and 65536
-before the field was added. If you change `CTX_SIZE` in `qwen38.env`,
-rerun `wire-qwen-code` (on every machine running `qwen-code` against this
-server, laptops included) so the client's number stays in sync.
+It also writes `generationConfig.contextWindowSize: $CLIENT_CTX_SIZE` into
+that provider entry — note `CLIENT_CTX_SIZE`, not `CTX_SIZE`. Without this
+field at all, `qwen-code` assumes the model's *advertised* context
+(Qwen3.8's ~1,000,000-token YaRN-extended native context) rather than what
+this server is actually configured to serve, and paces its own
+auto-compaction against that wrong number — meaning it keeps growing the
+conversation until it hits a hard `400 ... exceeds the available context
+size` error instead of compacting proactively. Confirmed directly: this
+recurred at both 32768 and 65536. Reporting the *exact* real `CTX_SIZE`
+still isn't enough either — also confirmed directly: at `CTX_SIZE=65536`
+reported exactly, a real session still overshot to 68046 tokens and
+hard-failed, because `qwen-code`'s own token counts are estimates and a
+single large step can jump past its compaction trigger before compaction
+runs. `CLIENT_CTX_SIZE` is deliberately lower than `CTX_SIZE` (currently
+57344 vs. 73728) — the gap is the safety margin. If you change either
+value, rerun `wire-qwen-code` (on every machine running `qwen-code`
+against this server, laptops included) so the client's number stays in
+sync.
 
 ## Client-only setup (a laptop or other machine that doesn't run the server)
 

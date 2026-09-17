@@ -46,12 +46,23 @@ PORT="8000"
 SERVER_HOST="127.0.0.1"
 
 # CTX_SIZE: mitigates llama.cpp#27623 (decode throughput collapses ~25x past
-# ~80K KV position on this hybrid Gated-DeltaNet architecture). 65536 leaves
-# ~16K margin below that threshold. The script warns (does not block) if you
-# raise this above 81920. NOTE: qwen-code's own tool/system prompt plus
-# conversation history can exceed 32768 in normal use (confirmed: a single
-# real session hit 34163 tokens) — don't go back below ~65536 without reason.
-CTX_SIZE="65536"
+# ~80K KV position on this hybrid Gated-DeltaNet architecture). 73728 leaves
+# a real margin below that threshold. The script warns (does not block) if
+# you raise this above 81920. History: started at 32768 (too tight for real
+# qwen-code sessions — hit 34163 tokens), raised to 65536 (still hit —
+# 69081 tokens), now 73728 with CLIENT_CTX_SIZE (below) doing the real work
+# of keeping qwen-code's own compaction well clear of this ceiling.
+CTX_SIZE="73728"
+
+# CLIENT_CTX_SIZE: what we tell qwen-code via generationConfig.
+# contextWindowSize — deliberately LOWER than CTX_SIZE, not equal to it.
+# qwen-code's token counts are estimates (its own debug log marks them
+# `estimated=true`), and a single large step (e.g. one big tool result) can
+# jump past its compaction trigger before compaction runs. Confirmed by
+# hand: reporting the exact CTX_SIZE (65536 at the time) still overshot to
+# 68046 tokens and hard-failed. Keep this comfortably below CTX_SIZE —
+# the gap is the safety margin.
+CLIENT_CTX_SIZE="57344"
 
 # UBATCH_SIZE / BATCH_SIZE: mitigate llama.cpp#28211 (prompts longer than
 # n_ubatch get SILENTLY WRONG logits on HIP/gfx1151 — no crash, just bad
