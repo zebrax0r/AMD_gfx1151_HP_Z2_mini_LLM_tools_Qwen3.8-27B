@@ -190,10 +190,21 @@ So `wire-qwen-code` also sets three more (global, not provider-specific)
 chars / 1,000 lines to 8,000 / 300 — this bounds how much a single tool
 call can add; the stock default still let a *batch* of several fanned-out
 tool calls add up to more than the whole `CLIENT_CTX_SIZE` margin), and
-`model.sessionTokenLimit` (50,000 — a deterministic backstop that blocks
+`model.sessionTokenLimit` (65,536 — a deterministic backstop that blocks
 sending the next message outright once the recorded prompt is already over
 budget, independent of token-count estimation entirely). These require a
 fresh `qwen` session to take effect, not just a Ctrl+Y retry.
+
+**Ordering matters for `sessionTokenLimit`** — it must sit *above*
+`CLIENT_CTX_SIZE` (57344), not below it. Confirmed by getting this wrong
+first: an initial value of 50,000 fired the hard block *before* proactive
+compaction ever got a chance to run, so every session hit a wall requiring
+manual `/compress`/`/clear` instead of compacting quietly. 65,536 sits
+between `CLIENT_CTX_SIZE` (soft compaction trigger) and the real `CTX_SIZE`
+(73,728, hard server limit), restoring it as a true last resort. If you see
+`Session token limit exceeded` from `qwen-code` itself, that's this
+backstop working as intended, not a bug — `/compress` or `/clear` as it
+suggests.
 
 We deliberately did **not** reach for llama-server's `--context-shift`
 here, even though it's designed for exactly this (discard old context

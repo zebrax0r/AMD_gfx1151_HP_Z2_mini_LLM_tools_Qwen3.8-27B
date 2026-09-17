@@ -79,7 +79,7 @@ CLIENT_CTX_SIZE="57344"
 # take effect, not just a retry.
 QWEN_TOOL_OUTPUT_THRESHOLD="8000"
 QWEN_TOOL_OUTPUT_LINES="300"
-QWEN_SESSION_TOKEN_LIMIT="50000"
+QWEN_SESSION_TOKEN_LIMIT="65536"
 
 # UBATCH_SIZE / BATCH_SIZE: mitigate llama.cpp#28211 (prompts longer than
 # n_ubatch get SILENTLY WRONG logits on HIP/gfx1151 — no crash, just bad

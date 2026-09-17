@@ -80,9 +80,20 @@ load_env() {
   # server-side. NOT applied via context-shift server-side (deliberately
   # rejected — see README: recurrent/hybrid memory can't be partially
   # truncated, risking corruption, not just a performance hit).
+  #
+  # ORDERING MATTERS: QWEN_SESSION_TOKEN_LIMIT must be HIGHER than
+  # CLIENT_CTX_SIZE, not lower. Confirmed by hand getting this wrong: an
+  # initial 50000 (below CLIENT_CTX_SIZE=57344) made the hard block fire
+  # *before* qwen-code's own proactive compaction ever got a chance to run
+  # automatically — every session just hit a wall requiring manual
+  # /compress or /clear instead of compacting quietly in the background.
+  # The intended layering is: CLIENT_CTX_SIZE (~57K) triggers soft
+  # automatic compaction first; QWEN_SESSION_TOKEN_LIMIT (~66K) is a true
+  # last-resort hard stop, comfortably below the real CTX_SIZE (73728) so
+  # it still catches a runaway single turn before that hits the server.
   QWEN_TOOL_OUTPUT_THRESHOLD="${QWEN_TOOL_OUTPUT_THRESHOLD:-8000}"
   QWEN_TOOL_OUTPUT_LINES="${QWEN_TOOL_OUTPUT_LINES:-300}"
-  QWEN_SESSION_TOKEN_LIMIT="${QWEN_SESSION_TOKEN_LIMIT:-50000}"
+  QWEN_SESSION_TOKEN_LIMIT="${QWEN_SESSION_TOKEN_LIMIT:-65536}"
   UBATCH_SIZE="${UBATCH_SIZE:-8192}"
   BATCH_SIZE="${BATCH_SIZE:-8192}"
   PARALLEL="${PARALLEL:-1}"
@@ -547,6 +558,8 @@ EOF
   fi
 
   [[ "$CLIENT_CTX_SIZE" -lt "$CTX_SIZE" ]] || warn "CLIENT_CTX_SIZE ($CLIENT_CTX_SIZE) is not lower than CTX_SIZE ($CTX_SIZE) — this removes qwen-code's safety margin and it will likely overshoot into a hard 400 again."
+  [[ "$QWEN_SESSION_TOKEN_LIMIT" -gt "$CLIENT_CTX_SIZE" ]] || warn "QWEN_SESSION_TOKEN_LIMIT ($QWEN_SESSION_TOKEN_LIMIT) is not higher than CLIENT_CTX_SIZE ($CLIENT_CTX_SIZE) — the hard session-token block will fire before qwen-code's own proactive compaction gets a chance to run, so sessions will hit a wall requiring manual /compress or /clear instead of compacting automatically. Confirmed by hand — see README."
+  [[ "$QWEN_SESSION_TOKEN_LIMIT" -lt "$CTX_SIZE" ]] || warn "QWEN_SESSION_TOKEN_LIMIT ($QWEN_SESSION_TOKEN_LIMIT) is not lower than CTX_SIZE ($CTX_SIZE) — it won't catch a runaway turn before the server's real hard limit does."
 
   # generationConfig.contextWindowSize tells qwen-code our ceiling.
   # Deliberately CLIENT_CTX_SIZE (lower than the real CTX_SIZE), not
