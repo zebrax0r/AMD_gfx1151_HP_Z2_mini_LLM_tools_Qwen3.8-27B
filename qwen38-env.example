@@ -1,0 +1,85 @@
+# Copy this file to qwen38.env and edit as needed.
+# qwen38.env is gitignored — it's your local, possibly-secret-bearing config.
+#
+# Every default below is chosen to mitigate a specific, currently-open
+# upstream llama.cpp bug on gfx1151 (Strix Halo). See README.md "Known
+# upstream bugs" table and docs/TROUBLESHOOTING.md before changing them.
+
+# --- Paths ---
+LLAMA_CPP_DIR="vendor/llama.cpp"
+MODEL_DIR="models"
+LOG_DIR="logs"
+SECRETS_DIR=".secrets"
+
+# --- ROCm ---
+# Leave unset to use the system default (/opt/rocm). Set this if you installed
+# a TheRock nightly tarball to a side-by-side prefix instead (see README §2b).
+#ROCM_PATH="/home/zebra/rocm-therock-nightly"
+GPU_TARGET="gfx1151"
+
+# --- Model source ---
+# Primary: bartowski explicitly states a minimum required llama.cpp build
+# (b10896+), which is useful as a version sanity-check. Fallback: unsloth's
+# Dynamic v3.0 quants, uncomment MODEL_REPO/MODEL_FILE/MMPROJ_FILE below to
+# switch.
+MODEL_REPO="bartowski/Qwen3.8-27B-GGUF"
+MODEL_FILE="Qwen3.8-27B-Q8_0.gguf"
+MMPROJ_FILE="mmproj-Qwen3.8-27B-bf16.gguf"
+MODEL_FILE_EXPECT_BYTES=29116388960     # ~29.1GB, sanity check only, not exact
+MMPROJ_FILE_EXPECT_BYTES=931145952      # ~931MB, sanity check only, not exact
+
+#MODEL_REPO="unsloth/Qwen3.8-27B-GGUF"
+#MODEL_FILE="Qwen3.8-27B-UD-Q8_K_XL.gguf"
+#MMPROJ_FILE="mmproj-F16.gguf"
+
+SERVED_MODEL_NAME="qwen3.8-27b"
+
+# --- Server ---
+HOST="0.0.0.0"
+PORT="8000"
+
+# SERVER_HOST: the address a CLIENT uses to reach this server — different
+# from HOST above (the bind address). Leave as 127.0.0.1 on the machine
+# that actually runs `build`/`serve`. On a client-only machine (e.g. a
+# laptop that only runs `wire-qwen-code`, cloned from this same repo),
+# set this to the server machine's LAN IP or hostname instead.
+SERVER_HOST="127.0.0.1"
+
+# CTX_SIZE: mitigates llama.cpp#27623 (decode throughput collapses ~25x past
+# ~80K KV position on this hybrid Gated-DeltaNet architecture). 65536 leaves
+# ~16K margin below that threshold. The script warns (does not block) if you
+# raise this above 81920. NOTE: qwen-code's own tool/system prompt plus
+# conversation history can exceed 32768 in normal use (confirmed: a single
+# real session hit 34163 tokens) — don't go back below ~65536 without reason.
+CTX_SIZE="65536"
+
+# UBATCH_SIZE / BATCH_SIZE: mitigate llama.cpp#28211 (prompts longer than
+# n_ubatch get SILENTLY WRONG logits on HIP/gfx1151 — no crash, just bad
+# output). Raised well above the llama.cpp stock default of 512 to push the
+# silently-broken-output boundary past the overwhelming majority of real
+# chat/tool-calling prompts. This does NOT fix the upstream bug — it is
+# still open. Keep BATCH_SIZE == UBATCH_SIZE so there's no second, smaller,
+# invisible chunk boundary below the stated ceiling.
+UBATCH_SIZE="8192"
+BATCH_SIZE="8192"
+
+# PARALLEL: mitigates lemonade-sdk#3160 (progressive generation corruption
+# under concurrent/sustained load on ROCm-nightly gfx1151, recovers only on
+# full reload). Single-slot serving is the safe default. If you raise this,
+# strongly consider `./serve-qwen38.sh install-watchdog`.
+PARALLEL="1"
+
+GPU_LAYERS="999"        # full offload — unified memory, no VRAM ceiling
+FLASH_ATTN="auto"       # GGML_HIP_ROCWMMA_FATTN is compiled OFF (see build
+                         # flags in serve-qwen38.sh) due to llama.cpp#24437,
+                         # so "auto" picks a safe generic kernel per layer.
+
+# --- Security ---
+# Auto-generated on first `init` if this file is left blank; stored in
+# .secrets/api_key (chmod 600) and reused across runs.
+API_KEY=""
+
+# --- qwen-code CLI wiring ---
+# "user" -> ~/.qwen/.env   "project" -> $QWEN_PROJECT_DIR/.qwen/.env
+QWEN_ENV_TARGET="user"
+QWEN_PROJECT_DIR=""

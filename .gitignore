@@ -1,0 +1,8 @@
+qwen38.env
+vendor/
+models/
+.secrets/
+logs/
+build/
+.venv-hf/
+*.gguf
