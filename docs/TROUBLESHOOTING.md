@@ -148,6 +148,25 @@ This box had a separate, pre-existing Ollama-based Qwen3.8 deployment
 `wire-qwen-code` preserves that entry in `modelProviders.openai` (so you
 can switch back by hand) but changes which one is default.
 
+## `bench` left the server down instead of restoring it
+
+Shouldn't happen — `cmd_bench` installs a `trap ... EXIT INT TERM` that
+stops whatever it spawned and restarts the original `MODEL_FILE`
+regardless of how it exits. If it does happen anyway (e.g. a future edit
+reintroduces the bug below, or the box lost power mid-run), just
+`./serve-qwen38.sh serve` manually — nothing bench does is destructive to
+your actual model files or config.
+
+The specific bug already hit and fixed once: the cleanup state
+(`BENCH_CLEANUP_DONE`, `BENCH_ORIG_MODEL_FILE`) must be real global
+variables, not `local` to `cmd_bench`. `trap ... EXIT` fires at *script*
+exit, which happens after `cmd_bench` has already `return`ed — a `local`
+goes out of scope before that point, and the trap handler hits an "unbound
+variable" error under `set -u` instead of actually restoring anything.
+Confirmed by hand: an early version did exactly this and left the box
+down. If you're extending `cmd_bench`, keep any state the trap handler
+reads as a real global.
+
 ## General: this whole stack is young
 
 llama.cpp's support for Qwen3.8's hybrid Gated-DeltaNet architecture only

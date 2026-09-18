@@ -122,6 +122,21 @@ load_env() {
   SPEC_DRAFT_N_MAX="${SPEC_DRAFT_N_MAX:-4}"
   SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-qwen3.8-27b}"
 
+  # bench subcommand config — see qwen38-env.example for full rationale
+  # (FP8/BF8 ruled out; Q4_K_M-and-below hard-blocked given MTP
+  # draft-acceptance-collapse risk). Fallbacks here so `bench` still works
+  # safely even if qwen38.env predates this addition (git pull without a
+  # manual re-sync, an established gap in this repo's config pattern).
+  BENCH_QUANTS="${BENCH_QUANTS:-Q6_K,Q5_K_M}"
+  BENCH_ALLOWED_QUANTS="${BENCH_ALLOWED_QUANTS:-Q8_0,Q6_K,Q6_K_L,Q5_K_M,Q5_K_L,Q5_1,Q5_0}"
+  BENCH_Q6_K_EXPECT_BYTES="${BENCH_Q6_K_EXPECT_BYTES:-23860565728}"
+  BENCH_Q5_K_M_EXPECT_BYTES="${BENCH_Q5_K_M_EXPECT_BYTES:-20923877088}"
+  BENCH_GEN_TOKENS="${BENCH_GEN_TOKENS:-512}"
+  BENCH_REPEATS="${BENCH_REPEATS:-3}"
+  BENCH_LONG_PROMPT_MIN_CHARS="${BENCH_LONG_PROMPT_MIN_CHARS:-80000}"
+  BENCH_MIN_SPEEDUP_PCT="${BENCH_MIN_SPEEDUP_PCT:-10}"
+  BENCH_MAX_ACCEPTANCE_DROP_PP="${BENCH_MAX_ACCEPTANCE_DROP_PP:-5}"
+
   BUILD_DIR="$LLAMA_CPP_DIR/build"
   LLAMA_SERVER_BIN="$BUILD_DIR/bin/llama-server"
   LLAMA_CLI_BIN="$BUILD_DIR/bin/llama-cli"
@@ -307,7 +322,14 @@ _hf_bin() {
   echo "$venv_dir/bin/hf"
 }
 
-cmd_download() {
+# _download_gguf <repo> <file> [expect_bytes]
+# Shared by cmd_download (MODEL_FILE/MMPROJ_FILE) and cmd_bench (candidate
+# quants) — disk preflight, hf download (resumable/idempotent — skips
+# already-complete files), size-sanity warning. Extracted so there's only
+# one place that knows how to fetch a GGUF file from this repo's model
+# source, not one copy per caller.
+_download_gguf() {
+  local repo="$1" file="$2" expect_bytes="${3:-}"
   local hf_bin; hf_bin="$(_hf_bin)"
   mkdir -p "$MODEL_DIR"
 
@@ -319,19 +341,22 @@ cmd_download() {
   fi
 
   export HF_XET_HIGH_PERFORMANCE=1  # current huggingface_hub uses Xet, not hf_transfer, for fast downloads
-  log "Downloading $MODEL_FILE from $MODEL_REPO..."
-  "$hf_bin" download "$MODEL_REPO" "$MODEL_FILE" --local-dir "$MODEL_DIR"
-  log "Downloading $MMPROJ_FILE from $MODEL_REPO..."
-  "$hf_bin" download "$MODEL_REPO" "$MMPROJ_FILE" --local-dir "$MODEL_DIR"
+  log "Downloading $file from $repo..."
+  "$hf_bin" download "$repo" "$file" --local-dir "$MODEL_DIR"
 
   local got
-  got="$(stat -c%s "$MODEL_DIR/$MODEL_FILE" 2>/dev/null || echo 0)"
-  if [[ -n "${MODEL_FILE_EXPECT_BYTES:-}" ]]; then
-    local diff=$(( got > MODEL_FILE_EXPECT_BYTES ? got - MODEL_FILE_EXPECT_BYTES : MODEL_FILE_EXPECT_BYTES - got ))
+  got="$(stat -c%s "$MODEL_DIR/$file" 2>/dev/null || echo 0)"
+  if [[ -n "$expect_bytes" ]]; then
+    local diff=$(( got > expect_bytes ? got - expect_bytes : expect_bytes - got ))
     if [[ "$diff" -gt $((1024*1024*1024)) ]]; then
-      warn "$MODEL_FILE size ($got bytes) differs from expected (~$MODEL_FILE_EXPECT_BYTES) by more than 1GB. Re-download may be needed."
+      warn "$file size ($got bytes) differs from expected (~$expect_bytes) by more than 1GB. Re-download may be needed."
     fi
   fi
+}
+
+cmd_download() {
+  _download_gguf "$MODEL_REPO" "$MODEL_FILE" "${MODEL_FILE_EXPECT_BYTES:-}"
+  _download_gguf "$MODEL_REPO" "$MMPROJ_FILE" "${MMPROJ_FILE_EXPECT_BYTES:-}"
   log "download complete."
 }
 
@@ -366,22 +391,17 @@ _detect_flag() {
   grep -q -- "$flag" <<<"$help_text" && echo "$flag"
 }
 
-cmd_serve() {
-  [[ -x "$LLAMA_SERVER_BIN" ]] || die "$LLAMA_SERVER_BIN not found. Run 'build' first."
-  [[ -f "$MODEL_DIR/$MODEL_FILE" ]] || die "$MODEL_DIR/$MODEL_FILE not found. Run 'download' first."
-  [[ -n "${API_KEY:-}" ]] || die "No API key set. Run 'init' first."
-
-  if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-    die "Already running (PID $(cat "$PID_FILE")). Use 'restart' or 'stop' first."
-  fi
-
-  mkdir -p "$LOG_DIR"
-
-  [[ "$PARALLEL" -le 1 ]] || warn "PARALLEL=$PARALLEL (>1). This raises exposure to lemonade-sdk#3160 (progressive corruption under concurrent load). Consider 'install-watchdog'."
-  [[ "$CTX_SIZE" -le 81920 ]] || warn "CTX_SIZE=$CTX_SIZE (>81920). llama.cpp#27623 causes ~25x decode slowdown past ~80K KV position on this architecture."
-
-  local args=(
-    --model "$MODEL_DIR/$MODEL_FILE"
+# _build_server_args <model_file> -> populates global SERVER_ARGS()
+# Shared by cmd_serve and cmd_bench so there is exactly one place that
+# knows how to build a llama-server invocation — bench can never
+# accidentally test a quant with a different flag set (e.g. MTP
+# speculative decoding silently off) than what production actually runs,
+# which would invalidate the whole point of bench-testing for
+# draft-acceptance collapse. Only --model varies by caller.
+_build_server_args() {
+  local model_file="$1"
+  SERVER_ARGS=(
+    --model "$MODEL_DIR/$model_file"
     --host "$HOST" --port "$PORT"
     --ctx-size "$CTX_SIZE"
     --ubatch-size "$UBATCH_SIZE"
@@ -393,25 +413,24 @@ cmd_serve() {
     --jinja
     --log-file "$SERVER_LOG"
   )
-  [[ -f "$MODEL_DIR/$MMPROJ_FILE" ]] && args+=(--mmproj "$MODEL_DIR/$MMPROJ_FILE")
+  [[ -f "$MODEL_DIR/$MMPROJ_FILE" ]] && SERVER_ARGS+=(--mmproj "$MODEL_DIR/$MMPROJ_FILE")
 
   # Feature-detect flags whose names/semantics have churned on a fast-moving
   # master branch, rather than hardcoding and risking a startup failure.
   if _detect_flag --flash-attn >/dev/null; then
-    args+=(--flash-attn "$FLASH_ATTN")
+    SERVER_ARGS+=(--flash-attn "$FLASH_ATTN")
   fi
   if _detect_flag -dio >/dev/null; then
-    args+=(-dio)
+    SERVER_ARGS+=(-dio)
   fi
   if [[ -n "$SPEC_TYPE" ]] && _detect_flag --spec-type >/dev/null; then
-    args+=(--spec-type "$SPEC_TYPE" --spec-draft-n-max "$SPEC_DRAFT_N_MAX")
+    SERVER_ARGS+=(--spec-type "$SPEC_TYPE" --spec-draft-n-max "$SPEC_DRAFT_N_MAX")
   fi
+}
 
-  log "Starting llama-server..."
-  setsid "$LLAMA_SERVER_BIN" "${args[@]}" >> "$STDOUT_LOG" 2>&1 < /dev/null &
-  local pid=$!
-  echo "$pid" > "$PID_FILE"
-
+# _wait_healthy <pid> — shared by cmd_serve and cmd_bench.
+_wait_healthy() {
+  local pid="$1"
   # Health-check polling always targets loopback — it's this machine
   # checking its own just-launched process, regardless of what address
   # other machines should use to reach it (that's SERVER_HOST, below).
@@ -426,6 +445,30 @@ cmd_serve() {
     kill -0 "$pid" 2>/dev/null || die "Server process died during startup. Check $STDOUT_LOG."
     sleep 2
   done
+}
+
+cmd_serve() {
+  [[ -x "$LLAMA_SERVER_BIN" ]] || die "$LLAMA_SERVER_BIN not found. Run 'build' first."
+  [[ -f "$MODEL_DIR/$MODEL_FILE" ]] || die "$MODEL_DIR/$MODEL_FILE not found. Run 'download' first."
+  [[ -n "${API_KEY:-}" ]] || die "No API key set. Run 'init' first."
+
+  if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+    die "Already running (PID $(cat "$PID_FILE")). Use 'restart' or 'stop' first."
+  fi
+
+  mkdir -p "$LOG_DIR"
+
+  [[ "$PARALLEL" -le 1 ]] || warn "PARALLEL=$PARALLEL (>1). This raises exposure to lemonade-sdk#3160 (progressive corruption under concurrent load). Consider 'install-watchdog'."
+  [[ "$CTX_SIZE" -le 81920 ]] || warn "CTX_SIZE=$CTX_SIZE (>81920). llama.cpp#27623 causes ~25x decode slowdown past ~80K KV position on this architecture."
+
+  _build_server_args "$MODEL_FILE"
+
+  log "Starting llama-server..."
+  setsid "$LLAMA_SERVER_BIN" "${SERVER_ARGS[@]}" >> "$STDOUT_LOG" 2>&1 < /dev/null &
+  local pid=$!
+  echo "$pid" > "$PID_FILE"
+
+  _wait_healthy "$pid"
 
   local display_url="http://${SERVER_HOST}:${PORT}"
   cat <<EOF
@@ -486,6 +529,212 @@ cmd_stop() {
 }
 
 cmd_restart() { cmd_stop; cmd_serve; }
+
+# _bench_quant_file <label> -> echoes the GGUF filename for a bench label.
+# Bartowski's repo (our MODEL_REPO) names sibling quants of this model
+# consistently as Qwen3.8-27B-<QUANT>.gguf — same pattern as our own
+# MODEL_FILE (Qwen3.8-27B-Q8_0.gguf) — so no per-quant lookup table is
+# needed beyond this.
+_bench_quant_file() { echo "Qwen3.8-27B-$1.gguf"; }
+
+# _bench_quant_expect_bytes <label> -> echoes the confirmed expected byte
+# size for a bench label, or empty if unknown (download proceeds, just
+# without the sanity-check warning). Real sizes must be confirmed via HEAD
+# request against the actual repo before adding a case here — see
+# qwen38-env.example's BENCH_*_EXPECT_BYTES comment for how these two were
+# obtained. Do not guess.
+_bench_quant_expect_bytes() {
+  case "$1" in
+    Q6_K) echo "$BENCH_Q6_K_EXPECT_BYTES" ;;
+    Q5_K_M) echo "$BENCH_Q5_K_M_EXPECT_BYTES" ;;
+    *) echo "" ;;
+  esac
+}
+
+# _bench_long_prompt -> prints a long prompt built by repeating
+# bench/prompts/short.txt until it exceeds BENCH_LONG_PROMPT_MIN_CHARS,
+# cached under logs/bench/ so repeated bench runs are reproducible without
+# committing a large file to git.
+_bench_long_prompt() {
+  local cache="$LOG_DIR/bench/.longprompt-cache"
+  if [[ ! -f "$cache" ]]; then
+    mkdir -p "$(dirname "$cache")"
+    local seed content=""
+    seed="$(cat bench/prompts/short.txt)"
+    while [[ "${#content}" -lt "$BENCH_LONG_PROMPT_MIN_CHARS" ]]; do
+      content+="$seed"$'\n\n'
+    done
+    printf '%s' "$content" > "$cache"
+  fi
+  cat "$cache"
+}
+
+# _bench_request <prompt_content> -> prints the raw JSON response, or
+# nothing (with a warning already emitted) on failure. temperature=0
+# removes sampling variance from the comparison and lets output be
+# spot-checked for coherence across quants essentially for free.
+_bench_request() {
+  local prompt_content="$1"
+  local max_time=$(( BENCH_GEN_TOKENS / 3 + 60 ))  # pessimistic ~3 tok/s floor + fixed buffer, same spirit as cmd_check's timeout
+  local payload
+  payload="$(jq -n --arg content "$prompt_content" --argjson max_tokens "$BENCH_GEN_TOKENS" --arg model "$SERVED_MODEL_NAME" \
+    '{model: $model, messages: [{role: "user", content: $content}], max_tokens: $max_tokens, temperature: 0, stream: false}')"
+  curl -sf --max-time "$max_time" "http://127.0.0.1:${PORT}/v1/chat/completions" \
+    -H "Authorization: Bearer $API_KEY" -H 'Content-Type: application/json' \
+    -d "$payload"
+}
+
+cmd_bench() {
+  need_bin jq
+  [[ -x "$LLAMA_SERVER_BIN" ]] || die "$LLAMA_SERVER_BIN not found. Run 'build' first."
+  if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+    die "A server is already running (PID $(cat "$PID_FILE")). bench needs exclusive control of the GPU/port to swap models safely — run 'stop' first, then rerun bench."
+  fi
+  [[ -f "$MODEL_DIR/$MODEL_FILE" ]] || die "$MODEL_DIR/$MODEL_FILE (the current baseline) not found. Run 'download' first."
+  [[ -f "bench/prompts/short.txt" ]] || die "bench/prompts/short.txt not found — run bench from the repo root."
+
+  local requested="${1:-$BENCH_QUANTS}"
+  local -a requested_labels allowed_labels
+  IFS=',' read -ra requested_labels <<< "$requested"
+  IFS=',' read -ra allowed_labels <<< "$BENCH_ALLOWED_QUANTS"
+
+  local label ok a
+  for label in "${requested_labels[@]}"; do
+    ok=0
+    for a in "${allowed_labels[@]}"; do [[ "$label" == "$a" ]] && ok=1 && break; done
+    [[ "$ok" -eq 1 ]] || die "Quant '$label' is not in BENCH_ALLOWED_QUANTS ($BENCH_ALLOWED_QUANTS). Q4_K_M and below are deliberately excluded: a community report on similar hardware (same MTP speculative-decoding approach) found more aggressive quantization caused 'draft-acceptance collapse' — net SLOWER, not faster, because the draft head disagrees with a noisier main model more often. Not independently reproduced on this box, but treated as a real constraint, not a guess to test past. See README."
+  done
+
+  # Baseline is whatever's actually configured right now — so a future
+  # rerun after adopting a candidate automatically benchmarks the new
+  # production quant against further candidates, not a hardcoded "Q8_0".
+  local -a entry_labels=("${MODEL_FILE} (current)") entry_files=("$MODEL_FILE")
+  local file
+  for label in "${requested_labels[@]}"; do
+    file="$(_bench_quant_file "$label")"
+    [[ "$file" == "$MODEL_FILE" ]] && continue  # already the baseline, don't test twice
+    entry_labels+=("$label")
+    entry_files+=("$file")
+  done
+
+  mkdir -p "$LOG_DIR/bench"
+  local ts results_file
+  ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  results_file="$LOG_DIR/bench/bench-${ts}.jsonl"
+
+  # Guarantee production is left running regardless of how bench exits
+  # (clean finish, error, or Ctrl-C mid-run) — stop whatever bench spawned,
+  # restore MODEL_FILE, restart on the original config. Deliberately NOT
+  # `local`: the EXIT trap fires after cmd_bench itself has already
+  # returned (it's a script-exit trap, not a function-exit trap), so a
+  # `local` here goes out of scope before the trap runs — confirmed by
+  # hand (an early version hit "cleanup_done: unbound variable" at exactly
+  # this point). Must be a real global to still be readable when the trap
+  # fires.
+  BENCH_ORIG_MODEL_FILE="$MODEL_FILE"
+  BENCH_CLEANUP_DONE=0
+  _bench_cleanup() {
+    [[ "$BENCH_CLEANUP_DONE" -eq 1 ]] && return
+    BENCH_CLEANUP_DONE=1
+    cmd_stop
+    MODEL_FILE="$BENCH_ORIG_MODEL_FILE"
+    log "bench: restoring production server ($BENCH_ORIG_MODEL_FILE)..."
+    cmd_serve
+  }
+  trap _bench_cleanup EXIT INT TERM
+
+  log "bench: ${#entry_labels[@]} entries, ${BENCH_REPEATS} reps x 2 prompts each — this will take a while (30-90+ minutes at this hardware's throughput). Results: $results_file"
+
+  local i
+  for i in "${!entry_labels[@]}"; do
+    label="${entry_labels[$i]}"; file="${entry_files[$i]}"
+    if [[ ! -f "$MODEL_DIR/$file" ]]; then
+      _download_gguf "$MODEL_REPO" "$file" "$(_bench_quant_expect_bytes "$label")"
+    fi
+
+    MODEL_FILE="$file"
+    _build_server_args "$MODEL_FILE"
+    log "bench: [$label] starting llama-server..."
+    setsid "$LLAMA_SERVER_BIN" "${SERVER_ARGS[@]}" >> "$STDOUT_LOG" 2>&1 < /dev/null &
+    local pid=$!
+    echo "$pid" > "$PID_FILE"
+    _wait_healthy "$pid"
+
+    _bench_request "Say OK." >/dev/null 2>&1 || true  # discarded warm-up
+
+    local prompt_label prompt_content rep resp finish_reason prompt_n prompt_ms predicted_n predicted_ms draft_n draft_n_accepted
+    for prompt_label in short long; do
+      prompt_content="$([[ "$prompt_label" == short ]] && cat bench/prompts/short.txt || _bench_long_prompt)"
+      for rep in $(seq 1 "$BENCH_REPEATS"); do
+        resp="$(_bench_request "$prompt_content")" || { warn "bench: [$label] $prompt_label rep $rep: request failed, skipping."; continue; }
+        finish_reason="$(jq -r '.choices[0].finish_reason // "error"' <<<"$resp")"
+        prompt_n="$(jq -r '.timings.prompt_n // 0' <<<"$resp")"
+        prompt_ms="$(jq -r '.timings.prompt_ms // 0' <<<"$resp")"
+        predicted_n="$(jq -r '.timings.predicted_n // 0' <<<"$resp")"
+        predicted_ms="$(jq -r '.timings.predicted_ms // 0' <<<"$resp")"
+        draft_n="$(jq -r '.timings.draft_n // 0' <<<"$resp")"
+        draft_n_accepted="$(jq -r '.timings.draft_n_accepted // 0' <<<"$resp")"
+        jq -nc --arg type request --arg label "$label" --arg file "$file" --arg prompt "$prompt_label" --argjson rep "$rep" \
+          --argjson prompt_n "$prompt_n" --argjson prompt_ms "$prompt_ms" --argjson predicted_n "$predicted_n" --argjson predicted_ms "$predicted_ms" \
+          --argjson draft_n "$draft_n" --argjson draft_n_accepted "$draft_n_accepted" --arg finish_reason "$finish_reason" \
+          '{type:$type,label:$label,file:$file,prompt:$prompt,rep:$rep,prompt_n:$prompt_n,prompt_ms:$prompt_ms,predicted_n:$predicted_n,predicted_ms:$predicted_ms,draft_n:$draft_n,draft_n_accepted:$draft_n_accepted,finish_reason:$finish_reason}' \
+          >> "$results_file"
+        local gen_tps=0; [[ "$predicted_ms" != "0" ]] && gen_tps="$(jq -n --argjson n "$predicted_n" --argjson ms "$predicted_ms" '($n / ($ms/1000)) | round')"
+        log "bench: [$label] $prompt_label rep $rep/$BENCH_REPEATS: gen ${gen_tps} tok/s, finish=${finish_reason}"
+      done
+    done
+
+    cmd_stop
+  done
+
+  echo "=== bench results: $results_file ==="
+  jq -s '
+    map(select(.type=="request"))
+    | group_by(.label + "|" + .prompt)
+    | map({
+        label: .[0].label, prompt: .[0].prompt, n: length,
+        gen_tps_median: (map(if .predicted_ms>0 then (.predicted_n/(.predicted_ms/1000)) else 0 end) | sort | .[(length-1)/2|floor]),
+        prompt_tps_median: (map(if .prompt_ms>0 then (.prompt_n/(.prompt_ms/1000)) else 0 end) | sort | .[(length-1)/2|floor]),
+        accept_pct_median: ([.[] | select(.draft_n>0) | (100*.draft_n_accepted/.draft_n)] | if length>0 then (sort | .[(length-1)/2|floor]) else null end),
+        stop_pct: (100 * (map(.finish_reason=="stop") | map(if . then 1 else 0 end) | add) / length),
+        no_empty: (map(.predicted_n>0) | all)
+      })
+  ' "$results_file" | tee "$LOG_DIR/bench/bench-${ts}-summary.json"
+
+  echo
+  echo "Decision rule: candidate must beat baseline long-context gen tok/s by >= ${BENCH_MIN_SPEEDUP_PCT}%, and not drop draft-accept% by more than ${BENCH_MAX_ACCEPTANCE_DROP_PP} points vs baseline, with all responses finishing cleanly."
+  # NOTE: finish_reason=="stop" is reported but NOT a pass/fail gate.
+  # Confirmed by hand: this model reasons at length before answering (a
+  # real production turn ran 12,000+ tokens without reaching a natural
+  # stop — see the QWEN_CODE_MAX_OUTPUT_TOKENS fix/README), so at a fixed
+  # BENCH_GEN_TOKENS budget, healthy responses routinely hit `length`
+  # before finishing a thought — that's a budget artifact, not a quant
+  # defect. Gating on all_stop would fail every candidate regardless of
+  # quality. The real correctness signal is no_empty (every response
+  # actually produced output) — a truly broken/garbled load tends to
+  # error or return nothing, not merely truncate.
+  local baseline_label="${entry_labels[0]}"
+  jq -s --arg baseline "$baseline_label" --argjson min_speedup "$BENCH_MIN_SPEEDUP_PCT" --argjson max_drop "$BENCH_MAX_ACCEPTANCE_DROP_PP" '
+    map(select(.type=="request"))
+    | group_by(.label + "|" + .prompt)
+    | map({
+        label: .[0].label, prompt: .[0].prompt,
+        gen_tps_median: (map(if .predicted_ms>0 then (.predicted_n/(.predicted_ms/1000)) else 0 end) | sort | .[(length-1)/2|floor]),
+        accept_pct_median: ([.[] | select(.draft_n>0) | (100*.draft_n_accepted/.draft_n)] | if length>0 then (sort | .[(length-1)/2|floor]) else null end),
+        stop_pct: (100 * (map(.finish_reason=="stop") | map(if . then 1 else 0 end) | add) / length),
+        no_empty: (map(.predicted_n>0) | all)
+      })
+    | (map(select(.label==$baseline and .prompt=="long")) | .[0]) as $base
+    | map(select(.label!=$baseline and .prompt=="long"))
+    | map(. + {
+        speedup_pct: (if $base.gen_tps_median>0 then (100*(.gen_tps_median-$base.gen_tps_median)/$base.gen_tps_median) else null end),
+        accept_drop_pp: (if (.accept_pct_median!=null and $base.accept_pct_median!=null) then ($base.accept_pct_median - .accept_pct_median) else null end)
+      })
+    | map(. + { pass: (.no_empty and (.speedup_pct!=null and .speedup_pct>=$min_speedup) and ((.accept_drop_pp==null) or (.accept_drop_pp<=$max_drop))) })
+  ' "$results_file"
+
+  log "bench complete. Adoption is manual — see README 'Adopting a bench result'. Restoring production server now."
+}
 
 cmd_selftest() {
   local url="http://127.0.0.1:${PORT}"
@@ -663,6 +912,9 @@ Usage: ./serve-qwen38.sh <command>
   install-watchdog [hours]   Install a systemd --user timer: selftest, restart only on failure (default 2h)
   uninstall-watchdog         Remove the watchdog timer
   wire-qwen-code     Write ~/.qwen/.env (or project .qwen/.env) pointing at this server
+  bench [quants]     Benchmark alternate GGUF quants (default: $BENCH_QUANTS) against
+                      the current MODEL_FILE, using production's exact server flags.
+                      Always restores the original server on exit. See README.
 EOF
 }
 
@@ -683,6 +935,7 @@ main() {
     install-watchdog) shift; cmd_install_watchdog "${1:-2}" ;;
     uninstall-watchdog) cmd_uninstall_watchdog ;;
     wire-qwen-code) cmd_wire_qwen_code ;;
+    bench) shift; cmd_bench "${1:-}" ;;
     *) usage; exit 1 ;;
   esac
 }

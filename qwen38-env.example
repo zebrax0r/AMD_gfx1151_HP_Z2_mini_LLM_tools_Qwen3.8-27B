@@ -32,6 +32,47 @@ MMPROJ_FILE_EXPECT_BYTES=931145952      # ~931MB, sanity check only, not exact
 #MODEL_FILE="Qwen3.8-27B-UD-Q8_K_XL.gguf"
 #MMPROJ_FILE="mmproj-F16.gguf"
 
+# --- Quantization benchmarking (`bench` subcommand) ---
+# Tests candidate quants against whatever MODEL_FILE is currently
+# configured (the baseline), using the exact same server flags production
+# uses (including MTP speculative decoding) — see README "Benchmarking
+# alternate quants" for the full methodology.
+#
+# FP8/BF8 is deliberately NOT an option here: gfx1151 (RDNA3.5) has no
+# native FP8/BF8 matrix-core acceleration (that's CDNA3/CDNA4/RDNA4 only,
+# confirmed via AMD's own ROCm precision-support docs), llama.cpp has no
+# mainline GGUF FP8 quant type to load even if it did (PR #10055 unmerged
+# since Dec 2024), and even hypothetically both existed, FP8 and Q8_0 are
+# both ~8 bits/weight so there'd be no memory-bandwidth win either. A
+# smaller integer k-quant is the only real lever on this hardware.
+#
+# BENCH_ALLOWED_QUANTS is a hard allowlist, not just a recommendation —
+# `bench` refuses (does not warn) anything outside it. Q4_K_M and below are
+# deliberately excluded: a community report on similar hardware (same MTP
+# speculative-decoding approach) found Q4 got net SLOWER, not faster,
+# because the smaller/noisier quant's outputs diverged too far from what
+# the MTP draft head expects ("draft-acceptance collapse") — not
+# independently reproduced on this exact box, but the risk is specific to
+# our production config (speculative decoding on), so treat it as a real
+# constraint until proven otherwise, not a guess to test past.
+BENCH_QUANTS="Q6_K,Q5_K_M"
+BENCH_ALLOWED_QUANTS="Q8_0,Q6_K,Q6_K_L,Q5_K_M,Q5_K_L,Q5_1,Q5_0"
+
+# Real byte sizes confirmed via HEAD request against bartowski's repo
+# (2026-09-18) — do not guess these for a different quant/repo, confirm
+# first (e.g. `curl -sIL <resolve-url> | grep -i content-length`).
+BENCH_Q6_K_EXPECT_BYTES=23860565728
+BENCH_Q5_K_M_EXPECT_BYTES=20923877088
+
+BENCH_GEN_TOKENS="512"          # generated tokens per request — enough for a stable tok/s reading
+BENCH_REPEATS="3"               # per (quant, prompt) pair; median reported, absorbs one-off noise
+BENCH_LONG_PROMPT_MIN_CHARS="80000"   # matches real measured qwen-code prompt sizes on this setup
+
+# Decision-rule thresholds — see README "Adopting a bench result". Named
+# constants rather than magic numbers, so they're easy to revisit later.
+BENCH_MIN_SPEEDUP_PCT="10"          # candidate must beat baseline long-context gen tok/s by at least this %
+BENCH_MAX_ACCEPTANCE_DROP_PP="5"    # candidate's MTP draft-accept ratio must not fall more than this many percentage points vs baseline
+
 SERVED_MODEL_NAME="qwen3.8-27b"
 
 # --- Server ---

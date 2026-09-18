@@ -88,6 +88,90 @@ discarding the entire in-flight response. Hitting the 10,000-token cap
 instead gives a clean `finish_reason: length` you can ask it to continue
 from, rather than losing the whole response to a timeout.
 
+## Benchmarking alternate quants
+
+**Why not FP8/BF8?** Ruled out, not implemented. gfx1151 (RDNA3.5) has
+zero native FP8/BF8 matrix-core acceleration — that's a CDNA3/CDNA4/RDNA4
+feature only, confirmed via AMD's own ROCm precision-support docs.
+Separately, llama.cpp has no mainline GGUF FP8 quant type to load even if
+the hardware supported it (PR #10055 has been in unmerged draft status
+since Dec 2024). And even in the hypothetical where both existed, FP8 and
+our current Q8_0 are both ~8 bits/weight, so there'd be no
+memory-bandwidth win either. A smaller integer k-quant is the only real
+lever on this hardware.
+
+**`./serve-qwen38.sh bench [quants]`** benchmarks candidate GGUF quants
+(default: `BENCH_QUANTS`, currently `Q6_K,Q5_K_M`) against whatever
+`MODEL_FILE` is *currently* configured (the baseline — so after adopting a
+new default, a future `bench` run automatically benchmarks that as the new
+baseline, not a hardcoded `Q8_0`). It uses `_build_server_args` — the exact
+same function `serve` itself calls — so every candidate is tested with
+production's real flags, MTP speculative decoding included. This matters:
+a community report on similar hardware (same MTP-speculative-decoding
+approach) found more aggressive quantization (Q4_K_M) made things net
+*slower*, not faster, because the smaller/noisier quant's outputs
+diverged too far from what the MTP draft head expects
+("draft-acceptance collapse") — not independently reproduced on this
+exact box, but treated as a real constraint: `BENCH_ALLOWED_QUANTS` is a
+hard allowlist, and `bench` refuses (doesn't just warn about) anything
+outside it, currently Q6_K/Q6_K_L/Q5_K_M/Q5_K_L/Q5_1/Q5_0.
+
+`bench` downloads any missing candidate files, then sequentially (never
+concurrently — `PARALLEL=1` is already a hard constraint here, see
+lemonade-sdk#3160) serves each quant, fires a short realistic prompt
+(`bench/prompts/short.txt`) and a long-context prompt (built at runtime by
+repeating the short prompt until it exceeds `BENCH_LONG_PROMPT_MIN_CHARS`,
+matching real measured `qwen-code` prompt sizes) `BENCH_REPEATS` times
+each at `temperature=0`, and records `timings.prompt_n/predicted_n/
+draft_n/draft_n_accepted` per request to
+`logs/bench/bench-<timestamp>.jsonl`. **A full run is 30-90+ minutes** at
+this hardware's throughput (3 entries × 2 prompts × 3 repeats by default)
+— it runs in the foreground so you can watch progress.
+
+A `trap` guarantees the original production server is restored on exit no
+matter what — clean finish, error, or Ctrl-C mid-run (confirmed by hand:
+an early version of this had a real bug here — a `local` variable read by
+the trap handler went out of scope by the time the trap actually fired,
+since `trap ... EXIT` fires at script exit, after `cmd_bench` itself has
+already returned, not at the end of the function; fixed by making those
+globals instead).
+
+**Decision rule** (per candidate, within the same run only — never against
+historical numbers, to avoid conflating a real quant effect with
+thermal/driver/build drift): candidate's long-context generation tok/s
+must beat baseline's by ≥ `BENCH_MIN_SPEEDUP_PCT` (default 10%), MTP
+draft-acceptance ratio must not drop more than `BENCH_MAX_ACCEPTANCE_DROP_PP`
+points (default 5) vs. baseline, and every response must have produced
+real output (`no_empty`). **`finish_reason` is reported but not a
+pass/fail gate** — confirmed by hand: this model reasons at length before
+answering (a real production turn ran 12,000+ tokens without reaching a
+natural stop, see above), so at a fixed token budget, healthy responses
+routinely hit `length` before finishing a thought. Gating on that would
+fail every candidate regardless of quality. `bench` prints a recommendation
+but does **not** touch `qwen38.env` or auto-switch — adoption is always a
+manual, deliberate step (below). **"No candidate passes" is a valid,
+useful outcome** — it would mean this box is kernel-overhead-bound rather
+than memory-bandwidth-bound, which is itself worth knowing.
+
+### Adopting a bench result
+
+1. Hand-edit `qwen38.env`: `MODEL_FILE` and `MODEL_FILE_EXPECT_BYTES` to
+   the winning quant's filename/size (see `qwen38-env.example`'s
+   `BENCH_*_EXPECT_BYTES` comments for where those numbers came from).
+2. Keep the old `Q8_0` file on disk — don't delete it. Disk isn't a
+   constraint (3.5TB free on this box), and it makes rollback a two-line
+   edit instead of a multi-minute re-download.
+3. `./serve-qwen38.sh restart`, then `selftest`, then a few real hands-on
+   `qwen-code` sessions before fully trusting it.
+4. Update `qwen38-env.example`'s defaults and this README's "Expected
+   performance" section with the real measured numbers (dated, "confirmed
+   by hand" style, matching the rest of this doc).
+5. Commit, push.
+
+**Rolling back**: revert `qwen38.env`'s two `MODEL_FILE*` lines to the
+Q8_0 values, `restart`, `selftest` — no re-download needed since the old
+file was deliberately kept.
+
 ## Quickstart
 
 ```bash
