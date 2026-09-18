@@ -36,7 +36,7 @@ periodically as fixes land upstream.
 | Issue | Symptom | This repo's mitigation |
 |---|---|---|
 | [llama.cpp#28211](https://github.com/ggml-org/llama.cpp/issues/28211) | HIP/gfx1151: prompts longer than `n_ubatch` get **silently wrong logits** (no crash) | `UBATCH_SIZE`/`BATCH_SIZE` default to 8192 (vs stock 512) — raises the ceiling, does not fix the bug |
-| [llama.cpp#27623](https://github.com/ggml-org/llama.cpp/issues/27623) | Decode throughput collapses ~25x once KV position exceeds ~80K tokens | `CTX_SIZE` defaults to 73728 (raised from 32768, then 65536 — both too tight for real `qwen-code` sessions, see below); `serve` warns if you raise it above 81920 |
+| [llama.cpp#27623](https://github.com/ggml-org/llama.cpp/issues/27623) | Upstream-reported ~25x decode collapse past ~80K KV tokens (other hardware/quants; issue still open) | **Retested directly on this exact build/quant 2026-09-18 — NOT reproduced** (sustained ~12-15 tok/s at ~97K context, see below). `CTX_SIZE` raised to 131072 accordingly; `serve` warns above 163840 (untested territory, not "known bad") |
 | [llama.cpp#20354](https://github.com/ggml-org/llama.cpp/issues/20354) | Gated-DeltaNet fused kernel runs on GPU on gfx1151 but performs no better than CPU fallback | Base rate is a performance ceiling, not fixable directly (~7-12 tok/s). Largely clawed back by MTP speculative decoding instead (`SPEC_TYPE=draft-mtp`, on by default) — measured **~14-20 tok/s**, ~1.9-2.7x, using the model's own draft head |
 | [llama.cpp#24437](https://github.com/ggml-org/llama.cpp/issues/24437) | `GGML_HIP_ROCWMMA_FATTN=ON` causes up to -41% prefill throughput on gfx1151 at 8K+ context, worsening with context length | Build compiles this flag **OFF** — a deliberate divergence from some "known-good Strix Halo" community recipes that set it ON |
 | [lemonade-sdk#3160](https://github.com/lemonade-sdk/lemonade/issues/3160) | Progressive generation corruption under sustained/concurrent load on ROCm-nightly gfx1151, recovers only on full reload | `PARALLEL=1` (single-slot serving) by default; use `restart` if output degrades, or `install-watchdog` for automated selftest-gated restarts |
@@ -296,7 +296,7 @@ reported exactly, a real session still overshot to 68046 tokens and
 hard-failed, because `qwen-code`'s own token counts are estimates and a
 single large step can jump past its compaction trigger before compaction
 runs. `CLIENT_CTX_SIZE` is deliberately lower than `CTX_SIZE` (currently
-57344 vs. 73728) — the gap is the safety margin.
+98304 vs. 131072) — the gap is the safety margin.
 
 **Even that margin isn't fully reliable** — confirmed directly a second
 time: a 16,384-token margin was completely consumed in one turn (74602
@@ -308,21 +308,50 @@ So `wire-qwen-code` also sets three more (global, not provider-specific)
 chars / 1,000 lines to 8,000 / 300 — this bounds how much a single tool
 call can add; the stock default still let a *batch* of several fanned-out
 tool calls add up to more than the whole `CLIENT_CTX_SIZE` margin), and
-`model.sessionTokenLimit` (65,536 — a deterministic backstop that blocks
+`model.sessionTokenLimit` (114,688 — a deterministic backstop that blocks
 sending the next message outright once the recorded prompt is already over
 budget, independent of token-count estimation entirely). These require a
 fresh `qwen` session to take effect, not just a Ctrl+Y retry.
 
 **Ordering matters for `sessionTokenLimit`** — it must sit *above*
-`CLIENT_CTX_SIZE` (57344), not below it. Confirmed by getting this wrong
-first: an initial value of 50,000 fired the hard block *before* proactive
-compaction ever got a chance to run, so every session hit a wall requiring
-manual `/compress`/`/clear` instead of compacting quietly. 65,536 sits
-between `CLIENT_CTX_SIZE` (soft compaction trigger) and the real `CTX_SIZE`
-(73,728, hard server limit), restoring it as a true last resort. If you see
+`CLIENT_CTX_SIZE`, not below it. Confirmed by getting this wrong first: an
+initial value of 50,000 (below the then-`CLIENT_CTX_SIZE` of 57,344) fired
+the hard block *before* proactive compaction ever got a chance to run, so
+every session hit a wall requiring manual `/compress`/`/clear` instead of
+compacting quietly. Current value (114,688) sits between `CLIENT_CTX_SIZE`
+(98,304, soft compaction trigger) and the real `CTX_SIZE` (131,072, hard
+server limit), restoring it as a true last resort. If you see
 `Session token limit exceeded` from `qwen-code` itself, that's this
 backstop working as intended, not a bug — `/compress` or `/clear` as it
 suggests.
+
+### The 80K "cliff" was retested and didn't reproduce
+
+All the numbers above were originally scaled around staying safely under
+llama.cpp#27623's reported ~80K-token decode-collapse cliff. On
+2026-09-18, that assumption was directly retested on this exact
+build/quant/config rather than taken on faith: a real ~97,176-token prompt
+was sent (comfortably past the reported collapse point), and decode speed
+was measured over two separate requests (53 and then 400 generated
+tokens, the second reusing a 99.9%-cached prefill). Result: a sustained
+**~12-15 tok/s**, right in line with normal short-context throughput — no
+collapse, and the output was coherent and on-topic (spot-checked by hand,
+not just timed). GPU memory was checked too: ~39GB of the 47GB GTT pool in
+use with a 140,032-token ctx-size allocated, comfortable headroom.
+
+**This does not mean #27623 is fixed** — it's still open upstream, was
+reported on different hardware/quants, and this was one test scenario
+(one prompt shape, Q5_K_M, MTP speculative decoding on). Nothing above
+~97K has actually been verified on this box, and the model's native
+context tops out at 262,144 — there's real headroom beyond 131072 that
+just hasn't been tested yet. `CTX_SIZE` was raised from 73728 to 131072
+(with `CLIENT_CTX_SIZE`/`QWEN_SESSION_TOKEN_LIMIT` scaled up
+proportionally, preserving the same layered-defense ratios), which is a
+large, real improvement for long coding sessions, but treat it as
+"verified up to ~97K with margin," not "safe all the way to native
+context." Re-verify after any `./serve-qwen38.sh update` picks up a new
+llama.cpp build — a kernel change could reintroduce the collapse just as
+easily as it could push the safe ceiling higher.
 
 We deliberately did **not** reach for llama-server's `--context-shift`
 here, even though it's designed for exactly this (discard old context

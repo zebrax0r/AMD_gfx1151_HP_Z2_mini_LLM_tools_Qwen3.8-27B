@@ -220,9 +220,14 @@ cmd_probe() {
   - llama.cpp#28211: HIP/gfx1151 gives silently WRONG logits on prompts
     longer than n_ubatch. Mitigation: UBATCH_SIZE/BATCH_SIZE default 8192
     (not a fix, just a much higher ceiling before the bug bites).
-  - llama.cpp#27623: decode throughput collapses ~25x past ~80K KV position
-    on this hybrid Gated-DeltaNet architecture. Mitigation: CTX_SIZE
-    defaults to 73728.
+  - llama.cpp#27623: upstream-reported ~25x decode collapse past ~80K KV
+    position on this hybrid Gated-DeltaNet architecture (other
+    hardware/quants; issue still open, unfixed). Retested directly on
+    THIS exact build/quant/config 2026-09-18: sustained ~12-15 tok/s
+    decode at ~97K context, no collapse observed. Not reproduced here, but
+    not a guarantee it can't recur (different build, different prompt
+    shape, near the 262144 native ceiling) — re-verify after any
+    ./serve-qwen38.sh update. CTX_SIZE defaults to 131072 accordingly.
   - llama.cpp#20354: the Gated-DeltaNet fused kernel runs on GPU on gfx1151
     but performs no better than CPU fallback (RDNA register-pressure/tuning
     gaps). Base rate ~7-12 tokens/sec; MTP speculative decoding (on by
@@ -459,7 +464,7 @@ cmd_serve() {
   mkdir -p "$LOG_DIR"
 
   [[ "$PARALLEL" -le 1 ]] || warn "PARALLEL=$PARALLEL (>1). This raises exposure to lemonade-sdk#3160 (progressive corruption under concurrent load). Consider 'install-watchdog'."
-  [[ "$CTX_SIZE" -le 81920 ]] || warn "CTX_SIZE=$CTX_SIZE (>81920). llama.cpp#27623 causes ~25x decode slowdown past ~80K KV position on this architecture."
+  [[ "$CTX_SIZE" -le 163840 ]] || warn "CTX_SIZE=$CTX_SIZE (>163840). Directly tested and safe up to ~97K on this exact build/quant as of 2026-09-18 (see llama.cpp#27623 in probe's known-bugs summary), but that's the limit of what's actually been verified — territory above this hasn't been tested, and the model's native context tops out at 262144."
 
   _build_server_args "$MODEL_FILE"
 
