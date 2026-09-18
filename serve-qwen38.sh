@@ -99,6 +99,15 @@ load_env() {
   PARALLEL="${PARALLEL:-1}"
   GPU_LAYERS="${GPU_LAYERS:-999}"
   FLASH_ATTN="${FLASH_ATTN:-auto}"
+  # MTP speculative decoding, using the model's own "nextn" tensors as a
+  # draft head (no separate draft model needed) — confirmed by hand: real
+  # measured throughput went from ~7.4 tok/s to ~14-20 tok/s (roughly
+  # 1.9-2.7x) on this exact model/quant/hardware, output verified correct
+  # (coherent reasoning, correct final answers, clean `finish_reason:
+  # "stop"`). Matches the flags already used by the pre-existing Ollama
+  # deployment on this same box. Set SPEC_TYPE="" to disable.
+  SPEC_TYPE="${SPEC_TYPE:-draft-mtp}"
+  SPEC_DRAFT_N_MAX="${SPEC_DRAFT_N_MAX:-4}"
   SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-qwen3.8-27b}"
 
   BUILD_DIR="$LLAMA_CPP_DIR/build"
@@ -186,11 +195,13 @@ cmd_probe() {
     (not a fix, just a much higher ceiling before the bug bites).
   - llama.cpp#27623: decode throughput collapses ~25x past ~80K KV position
     on this hybrid Gated-DeltaNet architecture. Mitigation: CTX_SIZE
-    defaults to 32768.
+    defaults to 73728.
   - llama.cpp#20354: the Gated-DeltaNet fused kernel runs on GPU on gfx1151
     but performs no better than CPU fallback (RDNA register-pressure/tuning
-    gaps). Expect roughly ~12 tokens/sec real-world, not comparable to
-    dedicated-HBM (MI210-class) numbers.
+    gaps). Base rate ~7-12 tokens/sec; MTP speculative decoding (on by
+    default, SPEC_TYPE=draft-mtp) measured at ~14-20 tokens/sec on this
+    exact model/quant/hardware. Not comparable to dedicated-HBM (MI210-
+    class) numbers either way.
   - llama.cpp#24437: GGML_HIP_ROCWMMA_FATTN causes up to -41% prefill
     throughput on gfx1151 at 8K+ context, worsening with context length.
     This build compiles it OFF (a deliberate divergence from some
@@ -380,6 +391,9 @@ cmd_serve() {
   if _detect_flag -dio >/dev/null; then
     args+=(-dio)
   fi
+  if [[ -n "$SPEC_TYPE" ]] && _detect_flag --spec-type >/dev/null; then
+    args+=(--spec-type "$SPEC_TYPE" --spec-draft-n-max "$SPEC_DRAFT_N_MAX")
+  fi
 
   log "Starting llama-server..."
   setsid "$LLAMA_SERVER_BIN" "${args[@]}" >> "$STDOUT_LOG" 2>&1 < /dev/null &
@@ -409,8 +423,10 @@ cmd_serve() {
    Base URL:    ${display_url}/v1
    Model alias: ${SERVED_MODEL_NAME}
    Ctx size:    ${CTX_SIZE} (qwen-code told: ${CLIENT_CTX_SIZE})   Ubatch: ${UBATCH_SIZE}   Parallel: ${PARALLEL}
-   Expect roughly ~7-12 tok/s (llama.cpp#20354, gfx1151 hybrid GDN kernel
-   ties CPU-fallback speed). See README for details.
+   Speculative: ${SPEC_TYPE:-off}$( [[ -n "$SPEC_TYPE" ]] && echo " (draft-n-max ${SPEC_DRAFT_N_MAX})" )
+   Expect roughly ~14-20 tok/s with MTP speculative decoding on (measured;
+   ~7-12 tok/s without it — llama.cpp#20354, gfx1151 hybrid GDN kernel ties
+   CPU-fallback speed at the base rate). See README for details.
 $( [[ "$SERVER_HOST" == "127.0.0.1" ]] && echo "   (SERVER_HOST is 127.0.0.1 — set it to this box's LAN IP in qwen38.env if other machines need to reach this server.)" )
 
  Smoke test:

@@ -37,28 +37,39 @@ periodically as fixes land upstream.
 |---|---|---|
 | [llama.cpp#28211](https://github.com/ggml-org/llama.cpp/issues/28211) | HIP/gfx1151: prompts longer than `n_ubatch` get **silently wrong logits** (no crash) | `UBATCH_SIZE`/`BATCH_SIZE` default to 8192 (vs stock 512) — raises the ceiling, does not fix the bug |
 | [llama.cpp#27623](https://github.com/ggml-org/llama.cpp/issues/27623) | Decode throughput collapses ~25x once KV position exceeds ~80K tokens | `CTX_SIZE` defaults to 73728 (raised from 32768, then 65536 — both too tight for real `qwen-code` sessions, see below); `serve` warns if you raise it above 81920 |
-| [llama.cpp#20354](https://github.com/ggml-org/llama.cpp/issues/20354) | Gated-DeltaNet fused kernel runs on GPU on gfx1151 but performs no better than CPU fallback | None possible — this is a performance ceiling, not a correctness bug. Expect **~12 tokens/sec**, not MI210-class numbers |
+| [llama.cpp#20354](https://github.com/ggml-org/llama.cpp/issues/20354) | Gated-DeltaNet fused kernel runs on GPU on gfx1151 but performs no better than CPU fallback | Base rate is a performance ceiling, not fixable directly (~7-12 tok/s). Largely clawed back by MTP speculative decoding instead (`SPEC_TYPE=draft-mtp`, on by default) — measured **~14-20 tok/s**, ~1.9-2.7x, using the model's own draft head |
 | [llama.cpp#24437](https://github.com/ggml-org/llama.cpp/issues/24437) | `GGML_HIP_ROCWMMA_FATTN=ON` causes up to -41% prefill throughput on gfx1151 at 8K+ context, worsening with context length | Build compiles this flag **OFF** — a deliberate divergence from some "known-good Strix Halo" community recipes that set it ON |
 | [lemonade-sdk#3160](https://github.com/lemonade-sdk/lemonade/issues/3160) | Progressive generation corruption under sustained/concurrent load on ROCm-nightly gfx1151, recovers only on full reload | `PARALLEL=1` (single-slot serving) by default; use `restart` if output degrades, or `install-watchdog` for automated selftest-gated restarts |
 
 ## Expected performance
 
-Realistically in the ballpark of **~7-12 tokens/sec** on this hybrid
+Base rate is in the ballpark of **~7-12 tokens/sec** on this hybrid
 architecture on gfx1151 (llama.cpp#20354 — the GPU kernel path doesn't beat
-CPU-fallback speed due to RDNA register-pressure/tuning gaps). Measured on
+CPU-fallback speed due to RDNA register-pressure/tuning gaps) — measured on
 this exact machine at Q8_0: prompt processing ~200-300 tok/s, generation a
-very consistent **~7.4 tok/s**. This is not comparable to dedicated-HBM
-datacenter cards (MI210/MI300-class). Capacity (96GB unified memory) is not
-the bottleneck here — kernel maturity on this specific GPU architecture is.
+very consistent ~7.4 tok/s without speculative decoding.
+
+**With `SPEC_TYPE=draft-mtp` (on by default)**, measured **~14-20 tok/s** —
+roughly 1.9-2.7x — using the model's own MTP "nextn" tensors as a draft
+head, no separate draft model needed. Output verified correct (coherent
+reasoning, correct final answers, clean `finish_reason: "stop"`) across
+multiple test prompts. This matches the flags already used by a
+pre-existing Ollama deployment found on this same box. Set `SPEC_TYPE=""`
+in `qwen38.env` to disable and fall back to plain decoding if you ever
+suspect it's causing an issue.
+
+Either way, this is not comparable to dedicated-HBM datacenter cards
+(MI210/MI300-class). Capacity (96GB unified memory) is not the bottleneck
+here — kernel maturity on this specific GPU architecture is.
 
 **If you're using `qwen-code` specifically**: its full agentic mode sends a
 large system/tool-definition prompt (measured ~8,000-20,000+ tokens on this
 setup, depending on loaded skills/tools) and can make several sequential
 LLM round-trips per user turn (tool calls, reasoning steps), each
 reprocessing a large chunk of that context with only partial cache reuse.
-Combined with ~7.4 tok/s generation, a single interactive request can
-realistically take **several minutes** end-to-end — this was confirmed
-directly (a trivial "reply with one word" prompt took multiple sequential
+Even with MTP's speedup, a single interactive request can realistically
+take **several minutes** end-to-end — this was confirmed directly (a
+trivial "reply with one word" prompt took multiple sequential
 ~40-80s round-trips before finishing). This is expected behavior on this
 hardware, not a hang — watch `./serve-qwen38.sh status` or tail
 `logs/qwen38.log` to confirm it's actively generating. `qwen --bare` skips

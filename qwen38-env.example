@@ -102,6 +102,16 @@ FLASH_ATTN="auto"       # GGML_HIP_ROCWMMA_FATTN is compiled OFF (see build
                          # flags in serve-qwen38.sh) due to llama.cpp#24437,
                          # so "auto" picks a safe generic kernel per layer.
 
+# SPEC_TYPE / SPEC_DRAFT_N_MAX: MTP speculative decoding, using the model's
+# own "nextn" tensors as a draft head (no separate draft model needed).
+# Confirmed by hand: real measured throughput went from ~7.4 tok/s to
+# ~14-20 tok/s (roughly 1.9-2.7x) on this exact model/quant/hardware,
+# output verified correct. Matches the flags already used by the
+# pre-existing Ollama deployment on this same box. Set SPEC_TYPE="" to
+# disable and fall back to plain decoding.
+SPEC_TYPE="draft-mtp"
+SPEC_DRAFT_N_MAX="4"
+
 # --- Security ---
 # Auto-generated on first `init` if this file is left blank; stored in
 # .secrets/api_key (chmod 600) and reused across runs.
