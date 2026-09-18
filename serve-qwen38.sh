@@ -57,7 +57,7 @@ load_env() {
   # `build`/`serve`) so `wire-qwen-code` and the `serve` banner print the
   # right address for that machine to use.
   SERVER_HOST="${SERVER_HOST:-127.0.0.1}"
-  CTX_SIZE="${CTX_SIZE:-73728}"
+  CTX_SIZE="${CTX_SIZE:-131072}"
   # CLIENT_CTX_SIZE is what we tell qwen-code via generationConfig.
   # contextWindowSize — deliberately LOWER than CTX_SIZE. qwen-code's own
   # token counts are estimates (its debug log literally logs
@@ -66,7 +66,7 @@ load_env() {
   # by hand: reporting the exact CTX_SIZE (65536) still overshot to 68046
   # and hard-failed. The gap between CLIENT_CTX_SIZE and CTX_SIZE is the
   # safety margin that absorbs that slop.
-  CLIENT_CTX_SIZE="${CLIENT_CTX_SIZE:-57344}"
+  CLIENT_CTX_SIZE="${CLIENT_CTX_SIZE:-98304}"
   # These three cap how much a SINGLE turn can grow the conversation, which
   # matters more than CLIENT_CTX_SIZE's margin does: confirmed by hand that
   # a single turn (many fanned-out tool calls) can add tens of thousands of
@@ -87,13 +87,16 @@ load_env() {
   # *before* qwen-code's own proactive compaction ever got a chance to run
   # automatically — every session just hit a wall requiring manual
   # /compress or /clear instead of compacting quietly in the background.
-  # The intended layering is: CLIENT_CTX_SIZE (~57K) triggers soft
-  # automatic compaction first; QWEN_SESSION_TOKEN_LIMIT (~66K) is a true
-  # last-resort hard stop, comfortably below the real CTX_SIZE (73728) so
-  # it still catches a runaway single turn before that hits the server.
+  # The intended layering is: CLIENT_CTX_SIZE triggers soft automatic
+  # compaction first; QWEN_SESSION_TOKEN_LIMIT is a true last-resort hard
+  # stop, comfortably below the real CTX_SIZE so it still catches a
+  # runaway single turn before that hits the server. Numbers scale
+  # together — see qwen38-env.example for current values and the
+  # 2026-09-18 CTX_SIZE history (this ordering rule doesn't change with
+  # the absolute numbers, only their ratios).
   QWEN_TOOL_OUTPUT_THRESHOLD="${QWEN_TOOL_OUTPUT_THRESHOLD:-8000}"
   QWEN_TOOL_OUTPUT_LINES="${QWEN_TOOL_OUTPUT_LINES:-300}"
-  QWEN_SESSION_TOKEN_LIMIT="${QWEN_SESSION_TOKEN_LIMIT:-65536}"
+  QWEN_SESSION_TOKEN_LIMIT="${QWEN_SESSION_TOKEN_LIMIT:-114688}"
   # Caps a single turn's generated tokens. Without this, qwen-code defaults
   # to the model's *declared* output limit — effectively unbounded here.
   # Confirmed by hand: a real turn generated 12,000+ tokens at a healthy,

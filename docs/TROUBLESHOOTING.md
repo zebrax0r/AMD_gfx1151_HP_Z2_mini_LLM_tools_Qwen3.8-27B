@@ -150,6 +150,39 @@ This box had a separate, pre-existing Ollama-based Qwen3.8 deployment
 `wire-qwen-code` preserves that entry in `modelProviders.openai` (so you
 can switch back by hand) but changes which one is default.
 
+## `wire-qwen-code` ran, no errors, but a config value (e.g. `sessionTokenLimit`) is still old
+
+Two things to check, in order:
+
+1. **Is `qwen38.env` actually current?** `wire-qwen-code` only writes
+   what's in `qwen38.env` — if a value was never explicitly set there, it
+   falls back to a default hardcoded inside `serve-qwen38.sh` itself.
+   Confirmed by hand (2026-09-18): those internal fallback defaults had
+   gone stale after a `CTX_SIZE` bump — `qwen38.env` files were updated,
+   but the script's own `${VAR:-default}` fallbacks weren't, so any
+   machine whose `qwen38.env` predated a given var (or never had it
+   explicitly set) silently kept the *old* number instead of the current
+   one. `wire-qwen-code`'s own ordering-validation warnings are a useful
+   tell here — if you see e.g. `QWEN_SESSION_TOKEN_LIMIT (65536) is not
+   lower than CTX_SIZE (65536)`, both sides of that comparison resolving
+   to the same stale number is a sign at least one of them is falling back
+   to an old default rather than reading a real value. Fix: `grep -E
+   "^CTX_SIZE=|^CLIENT_CTX_SIZE=|^QWEN_SESSION_TOKEN_LIMIT="
+   qwen38.env` and compare against current `qwen38-env.example` — add or
+   correct any missing/stale lines.
+2. **A fresh `qwen` session, not a retry** — `settings.json` is only read
+   at process startup (see the stream-lifetime-cap entry above for the
+   full explanation of this same gotcha in a different context).
+
+**On macOS**: if you hand-write a `sed -i '...'` fix (like the ones
+suggested in this repo's chat history) and it silently doesn't take
+effect, check whether you used Linux/GNU `sed -i` syntax — macOS ships
+BSD `sed`, which requires a backup-suffix argument (`sed -i '' '...'` or
+`sed -i.bak '...'`) and otherwise errors out or behaves unexpectedly
+without one. `serve-qwen38.sh` itself doesn't use `sed` (it uses `jq` for
+all JSON/config manipulation, which is portable), but any one-off manual
+fix command using `sed -i` needs the macOS-compatible form.
+
 ## `bench` left the server down instead of restoring it
 
 Shouldn't happen — `cmd_bench` installs a `trap ... EXIT INT TERM` that
