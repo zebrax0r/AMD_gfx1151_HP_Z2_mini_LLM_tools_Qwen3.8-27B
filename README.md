@@ -76,6 +76,18 @@ hardware, not a hang — watch `./serve-qwen38.sh status` or tail
 auto-discovery/tool loading for a lighter, faster session if you don't need
 the full agentic toolset.
 
+**`wire-qwen-code` also caps a single turn's output** at
+`QWEN_CODE_MAX_OUTPUT_TOKENS` (default 10,000) via
+`generationConfig.samplingParams.max_tokens`. Without this, `qwen-code`
+defaults to the model's *declared* output limit — effectively unbounded.
+Confirmed directly: a real turn generated 12,000+ tokens at a healthy,
+stable ~13.5 tok/s (no stall or corruption in the server logs) and was
+still going when `qwen-code`'s own 15-minute stream-lifetime cap
+(`QWEN_STREAM_MAX_LIFETIME_MS`, default 900000ms) killed the connection,
+discarding the entire in-flight response. Hitting the 10,000-token cap
+instead gives a clean `finish_reason: length` you can ask it to continue
+from, rather than losing the whole response to a timeout.
+
 ## Quickstart
 
 ```bash

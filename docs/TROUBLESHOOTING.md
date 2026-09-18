@@ -98,6 +98,33 @@ If it recurs even with all of the above, that's a strong signal the session's ge
 
 If it recurs even with this margin in place, that's a signal the session's genuine history has grown past a comfortable working set for this hardware — starting a fresh `qwen` session is more sustainable than continuing to raise the ceiling toward the decode-collapse threshold.
 
+## `[API Error: Stream exceeded its 900000ms upstream-wait cap after N chunks without completing...]`
+
+This is `qwen-code`'s own client-side stream-lifetime cap
+(`QWEN_STREAM_MAX_LIFETIME_MS`, default 900000ms = 15 min), not a server
+error — it kills the connection and **discards the entire in-flight
+response** if a single streamed reply runs longer than that, regardless of
+whether generation is healthy.
+
+First check the server side wasn't actually stuck: `tail logs/qwen38.log`
+for that time window — a healthy generation shows steady `n_gen`/`tg`
+climbing at a consistent tok/s (confirmed directly: one real incident
+generated 12,000+ tokens at a stable ~13.5 tok/s with no stall, so the
+throughput alone doesn't tell you whether the *content* was useful progress
+or a repetitive/stuck ramble — you'd need to check what `qwen-code` actually
+displayed).
+
+`wire-qwen-code` now sets `QWEN_CODE_MAX_OUTPUT_TOKENS` (default 10,000,
+via `generationConfig.samplingParams.max_tokens`) specifically to prevent
+this — without it, `qwen-code` defaults to the model's declared output
+limit (effectively unbounded here), so a long turn has nothing stopping it
+short of this 15-minute wall. If you still hit this after `wire-qwen-code`,
+either raise `QWEN_CODE_MAX_OUTPUT_TOKENS` further (if the task genuinely
+needs more output per turn) or investigate whether the model is stuck
+rambling rather than making real progress (check for repetitive content in
+the transcript) — raising the timeout alone doesn't fix a runaway
+generation, it just lets it run longer before losing the response anyway.
+
 ## `qwen-code` seems to hang / doesn't respond for a long time
 
 Likely not a hang. `qwen-code`'s full agentic mode sends a large system/

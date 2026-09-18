@@ -94,6 +94,18 @@ load_env() {
   QWEN_TOOL_OUTPUT_THRESHOLD="${QWEN_TOOL_OUTPUT_THRESHOLD:-8000}"
   QWEN_TOOL_OUTPUT_LINES="${QWEN_TOOL_OUTPUT_LINES:-300}"
   QWEN_SESSION_TOKEN_LIMIT="${QWEN_SESSION_TOKEN_LIMIT:-65536}"
+  # Caps a single turn's generated tokens. Without this, qwen-code defaults
+  # to the model's *declared* output limit — effectively unbounded here.
+  # Confirmed by hand: a real turn generated 12,000+ tokens at a healthy,
+  # stable ~13.5 tok/s (server logs show no stall/corruption) and was still
+  # going when qwen-code's own 15-minute stream-lifetime cap
+  # (QWEN_STREAM_MAX_LIFETIME_MS, default 900000ms) killed the connection —
+  # discarding the entire in-flight response instead of truncating cleanly.
+  # 10000 tokens / ~13.5 tok/s (low end of measured range) ≈ 12.3 min,
+  # comfortable margin under 15 min; hitting it gives a clean
+  # `finish_reason: length` you can just ask to continue from, rather than
+  # losing the whole response to a timeout.
+  QWEN_CODE_MAX_OUTPUT_TOKENS="${QWEN_CODE_MAX_OUTPUT_TOKENS:-10000}"
   UBATCH_SIZE="${UBATCH_SIZE:-8192}"
   BATCH_SIZE="${BATCH_SIZE:-8192}"
   PARALLEL="${PARALLEL:-1}"
@@ -602,6 +614,7 @@ EOF
     --argjson tool_output_threshold "$QWEN_TOOL_OUTPUT_THRESHOLD" \
     --argjson tool_output_lines "$QWEN_TOOL_OUTPUT_LINES" \
     --argjson session_token_limit "$QWEN_SESSION_TOKEN_LIMIT" \
+    --argjson max_output_tokens "$QWEN_CODE_MAX_OUTPUT_TOKENS" \
     '
     .env[$env_key] = $api_key
     | .modelProviders.openai = ((.modelProviders.openai // []) | map(select(.id != $provider_id)) + [{
@@ -610,7 +623,8 @@ EOF
           contextWindowSize: $ctx_size,
           timeout: 300000,
           streamIdleTimeoutMs: 600000,
-          maxRetries: 1
+          maxRetries: 1,
+          samplingParams: { max_tokens: $max_output_tokens }
         }
       }])
     | .security.auth = { baseUrl: $base_url, selectedType: "openai" }
