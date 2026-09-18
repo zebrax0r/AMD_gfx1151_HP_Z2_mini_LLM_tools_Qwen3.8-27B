@@ -22,11 +22,21 @@ GPU_TARGET="gfx1151"
 # (b10896+), which is useful as a version sanity-check. Fallback: unsloth's
 # Dynamic v3.0 quants, uncomment MODEL_REPO/MODEL_FILE/MMPROJ_FILE below to
 # switch.
+#
+# Q5_K_M adopted 2026-09-18 after `bench` (Q6_K,Q5_K_M vs Q8_0 baseline):
+# Q5_K_M passed with +17.7% long-context gen tok/s (16.1 vs 13.7 baseline)
+# and the SMALLER MTP draft-acceptance drop of the two passing candidates
+# (1.67pp vs Q6_K's 2.54pp) — both criteria favored Q5_K_M over Q6_K, not
+# just its smaller size. See README "Benchmarking alternate quants".
 MODEL_REPO="bartowski/Qwen3.8-27B-GGUF"
-MODEL_FILE="Qwen3.8-27B-Q8_0.gguf"
+MODEL_FILE="Qwen3.8-27B-Q5_K_M.gguf"
 MMPROJ_FILE="mmproj-Qwen3.8-27B-bf16.gguf"
-MODEL_FILE_EXPECT_BYTES=29116388960     # ~29.1GB, sanity check only, not exact
+MODEL_FILE_EXPECT_BYTES=20923877088     # ~20.9GB, confirmed via HEAD request
 MMPROJ_FILE_EXPECT_BYTES=931145952      # ~931MB, sanity check only, not exact
+
+# Previous default (Q8_0) — uncomment to roll back, see README.
+#MODEL_FILE="Qwen3.8-27B-Q8_0.gguf"
+#MODEL_FILE_EXPECT_BYTES=29116388960
 
 #MODEL_REPO="unsloth/Qwen3.8-27B-GGUF"
 #MODEL_FILE="Qwen3.8-27B-UD-Q8_K_XL.gguf"

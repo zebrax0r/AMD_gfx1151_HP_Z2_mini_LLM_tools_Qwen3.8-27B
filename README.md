@@ -62,6 +62,17 @@ Either way, this is not comparable to dedicated-HBM datacenter cards
 (MI210/MI300-class). Capacity (96GB unified memory) is not the bottleneck
 here — kernel maturity on this specific GPU architecture is.
 
+**Default quant is Q5_K_M (adopted 2026-09-18 via `bench`), not Q8_0.**
+With MTP speculative decoding, measured **~16.1 tok/s on long-context /
+~21.7 tok/s on short prompts** (median of 3 reps each), a real +17.7%
+over Q8_0's ~13.7 tok/s baseline on the same hardware/config, with a
+*smaller* MTP draft-acceptance drop than the also-tested Q6_K (1.67
+percentage points vs Q6_K's 2.54) — both the speed and the
+draft-acceptance criteria favored Q5_K_M, not just its smaller size (see
+"Benchmarking alternate quants" below). Quality spot-checked by hand
+post-adoption (code generation, a math word problem) — correct, coherent,
+no degradation observed. Full results: `logs/bench/bench-20260918T055248Z*`.
+
 **If you're using `qwen-code` specifically**: its full agentic mode sends a
 large system/tool-definition prompt (measured ~8,000-20,000+ tokens on this
 setup, depending on loaded skills/tools) and can make several sequential
@@ -178,7 +189,7 @@ file was deliberately kept.
 ./serve-qwen38.sh init          # dirs + API key
 ./serve-qwen38.sh probe         # GPU/ROCm/GTT preflight — read the warnings
 ./serve-qwen38.sh build         # clone+build llama.cpp from latest master
-./serve-qwen38.sh download      # fetch ~29.1GB Q8_0 GGUF + mmproj
+./serve-qwen38.sh download      # fetch ~20.9GB Q5_K_M GGUF + mmproj
 ./serve-qwen38.sh check         # bounded smoke-load test
 ./serve-qwen38.sh serve         # launch + wait for /health, prints connection banner
 ./serve-qwen38.sh wire-qwen-code   # point qwen-code CLI at this server
