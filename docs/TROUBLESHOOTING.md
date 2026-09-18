@@ -202,6 +202,75 @@ Confirmed by hand: an early version did exactly this and left the box
 down. If you're extending `cmd_bench`, keep any state the trap handler
 reads as a real global.
 
+## `SPEC_TYPE=""` in `qwen38.env` doesn't actually disable speculative decoding
+
+Fixed 2026-09-19, but worth knowing the mechanism if you're extending this
+script: bash's `${VAR:-default}` (colon-dash) treats an explicit empty
+string the *same* as unset, silently falling back to the default anyway.
+`serve-qwen38.sh`'s `load_env()` used exactly this pattern for `SPEC_TYPE`,
+so setting `SPEC_TYPE=""` for a model with no MTP-style draft head (like
+Laguna S 2.1) was silently being overridden back to `"draft-mtp"` — caught
+only because the server's own ordering-check printed a `Speculative:` line
+inconsistent with what `qwen38.env` actually said. Fixed with `${VAR=default}`
+(bare `=`, no colon), which only fills in the default when the variable is
+truly unset. If you add another var where "explicitly empty" needs to mean
+something different from "not set," use the same bare-`=` form, not `:-`.
+
+## Poolside's `llama.cpp` fork (branch `laguna`), DFlash speculative decoding hangs
+
+`"dflash requires ctx_other to be set (this warning is normal during
+memory fitting)"` followed by the process hanging (not crashing, not
+progressing — `pgrep` shows it alive, GPU memory stays near-idle,
+indefinitely). Reproduced with and without `-fa`. This is a real bug in
+that fork's draft-model memory-measurement path for this exact
+model/hardware combo, not a flag/config mistake — confirmed by reading
+the fork's own source (`src/llama-context.cpp`, `src/models/dflash.cpp`):
+`ctx_other` is how DFlash's draft model shares the target model's
+embedding/output-head weights, and the server isn't recovering from the
+expected-during-fitting exception the way the "this warning is normal"
+message implies it should. Not adopted — Laguna S 2.1 runs fine on
+**mainline** llama.cpp without speculative decoding (~26 tok/s, already
+faster than Qwen3.8-27B's best result), so this wasn't worth chasing
+further. If you want to retry: the target model itself works correctly on
+this same fork with plain decoding (only the `-md`/`--spec-type
+draft-dflash` combination is broken), so if the fork updates, it may be
+worth a quick retest — `git -C vendor/llama.cpp-poolside pull` then rerun
+the same command from the README's DFlash section.
+
+## Adding a new model: things that bit us, checklist for next time
+
+From the Qwen3.8-27B → Laguna S 2.1 switch:
+
+- **Sharded GGUF models** (multiple `-0000N-of-0000M.gguf` files): set
+  `MODEL_FILE` to the first shard, `MODEL_FILE_EXTRA_SHARDS` (comma-
+  separated) to the rest — `download` fetches all of them, `serve` only
+  needs the first shard's path (llama.cpp auto-detects siblings by
+  naming convention). Get real sizes via `curl -sIL <resolve-url> | grep
+  -i content-length` per shard — don't trust a "~XGB" figure from a
+  webpage scrape, HF's tree UI is JS-rendered and unreliable to scrape.
+- **`UBATCH_SIZE`/`BATCH_SIZE` are not free to leave at a previous
+  model's value.** Compute-buffer memory scales with ubatch size roughly
+  independent of context length — an 8192 value tuned for one model's
+  bug (llama.cpp#28211, Qwen-specific) cost ~4.3GB of GPU memory that a
+  different model might not need to spend at all. Test whether the new
+  model actually needs a large ubatch (a needle-in-haystack prompt
+  longer than the smaller candidate value, checking for exact retrieval)
+  before assuming the previous model's mitigation still applies.
+- **Check the model's own architecture file in your local llama.cpp
+  checkout** (`vendor/llama.cpp/src/models/<name>.cpp`) before assuming
+  GPU support is mature: does it use shared helpers like `build_attn`/
+  `build_moe_ffn` (mature, backend-complete, low risk) or introduce a
+  novel custom op (high risk of exactly the kernel-immaturity problems
+  documented throughout this repo's history for Qwen3.8's Gated-DeltaNet)?
+- **A model's own `--jinja`/tool-calling/reasoning support isn't
+  guaranteed to need the same server flags** as the previous model, but
+  in practice `--jinja` has been required by every model tried here so
+  far (Qwen3.8-27B, Laguna S 2.1) — check the model card's own serving
+  instructions before assuming, but it's a safe first guess.
+- **mmproj is optional** — `MMPROJ_FILE=""` for a non-multimodal model;
+  `_build_server_args`/`cmd_download` already handle this correctly
+  (conditional on the file existing / the variable being non-empty).
+
 ## General: this whole stack is young
 
 llama.cpp's support for Qwen3.8's hybrid Gated-DeltaNet architecture only

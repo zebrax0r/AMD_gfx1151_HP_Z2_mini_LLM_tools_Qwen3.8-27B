@@ -18,23 +18,59 @@ SECRETS_DIR=".secrets"
 GPU_TARGET="gfx1151"
 
 # --- Model source ---
-# Primary: bartowski explicitly states a minimum required llama.cpp build
-# (b10896+), which is useful as a version sanity-check. Fallback: unsloth's
-# Dynamic v3.0 quants, uncomment MODEL_REPO/MODEL_FILE/MMPROJ_FILE below to
-# switch.
 #
-# Q5_K_M adopted 2026-09-18 after `bench` (Q6_K,Q5_K_M vs Q8_0 baseline):
-# Q5_K_M passed with +17.7% long-context gen tok/s (16.1 vs 13.7 baseline)
-# and the SMALLER MTP draft-acceptance drop of the two passing candidates
-# (1.67pp vs Q6_K's 2.54pp) — both criteria favored Q5_K_M over Q6_K, not
-# just its smaller size. See README "Benchmarking alternate quants".
-MODEL_REPO="bartowski/Qwen3.8-27B-GGUF"
-MODEL_FILE="Qwen3.8-27B-Q5_K_M.gguf"
-MMPROJ_FILE="mmproj-Qwen3.8-27B-bf16.gguf"
-MODEL_FILE_EXPECT_BYTES=20923877088     # ~20.9GB, confirmed via HEAD request
-MMPROJ_FILE_EXPECT_BYTES=931145952      # ~931MB, sanity check only, not exact
+# Laguna S 2.1 (Poolside, July 2026) adopted 2026-09-19, replacing
+# Qwen3.8-27B as the default. Reason: Qwen3.8's hybrid Gated-DeltaNet
+# architecture is the root cause of most of this repo's known-bugs table
+# (llama.cpp#20354, #27623, #28211) — the whole current Qwen line
+# (3.5→3.8, including the Qwen4 preview) has doubled down on that same
+# architecture family, so a newer Qwen wouldn't help. Laguna S 2.1 uses
+# only conventional GQA + sliding-window attention — confirmed by reading
+# its `laguna.cpp` in our own llama.cpp checkout: built entirely from the
+# same shared `build_attn`/`build_moe_ffn` helpers dozens of other
+# well-supported models use, no novel custom op like Gated-DeltaNet
+# needed. Measured directly on this exact box: sustained ~26 tok/s with
+# NO speculative decoding at all — already faster than Qwen3.8-27B's best
+# result, which needed MTP speculative decoding to reach 14-23 tok/s.
+#
+# 118B total / 8B active MoE. Ships as 3 GGUF shards — MODEL_FILE is the
+# first (llama.cpp auto-detects the siblings by naming convention at load
+# time), MODEL_FILE_EXTRA_SHARDS lists the rest for `download` to fetch.
+# No mmproj (not multimodal) — MMPROJ_FILE intentionally left unset.
+# Sizes confirmed via HEAD request against the real files, not estimated.
+MODEL_REPO="unsloth/Laguna-S-2.1-GGUF"
+MODEL_FILE="UD-Q4_K_M/Laguna-S-2.1-UD-Q4_K_M-00001-of-00003.gguf"
+MODEL_FILE_EXTRA_SHARDS="UD-Q4_K_M/Laguna-S-2.1-UD-Q4_K_M-00002-of-00003.gguf,UD-Q4_K_M/Laguna-S-2.1-UD-Q4_K_M-00003-of-00003.gguf"
+MODEL_FILE_EXPECT_BYTES=3683648          # first shard only — tiny, mostly metadata; other two are ~49.9GB + ~23.2GB
+MMPROJ_FILE=""
 
-# Previous default (Q8_0) — uncomment to roll back, see README.
+# DFlash speculative decoding (Poolside's own draft-model mechanism, ~2x+
+# claimed speedup) was tried and deliberately NOT adopted: reproducibly
+# hangs during draft-model memory measurement on Poolside's llama.cpp
+# fork (branch `laguna`) in this exact config — "dflash requires
+# ctx_other to be set" followed by a hang, not a clean failure. A real
+# bug in that fork, not a flag/config issue on our end (tested with and
+# without -fa). SPEC_TYPE is empty below — Laguna has no MTP-style
+# "nextn" draft head like Qwen, and DFlash needs the broken fork, so
+# there is currently no working speculative-decoding path for this model.
+SPEC_TYPE=""
+
+# --- Previous model (Qwen3.8-27B) — kept as a documented, working
+# fallback. Uncomment this whole block AND set SPEC_TYPE=draft-mtp AND
+# clear MODEL_FILE_EXTRA_SHARDS AND restore MMPROJ_FILE AND set
+# UBATCH_SIZE/BATCH_SIZE back to 8192 (see that section below — Laguna's
+# smaller 2048 does NOT carry the same #28211 silent-corruption
+# protection for Qwen) to roll back; see README "Rolling back to
+# Qwen3.8-27B".
+#MODEL_REPO="bartowski/Qwen3.8-27B-GGUF"
+#MODEL_FILE="Qwen3.8-27B-Q5_K_M.gguf"
+#MMPROJ_FILE="mmproj-Qwen3.8-27B-bf16.gguf"
+#MODEL_FILE_EXPECT_BYTES=20923877088     # ~20.9GB, confirmed via HEAD request
+#MMPROJ_FILE_EXPECT_BYTES=931145952      # ~931MB, sanity check only, not exact
+#MODEL_FILE_EXTRA_SHARDS=""
+#SPEC_TYPE="draft-mtp"
+#
+# Even older default (Q8_0) — see README for full quant history.
 #MODEL_FILE="Qwen3.8-27B-Q8_0.gguf"
 #MODEL_FILE_EXPECT_BYTES=29116388960
 
@@ -83,7 +119,7 @@ BENCH_LONG_PROMPT_MIN_CHARS="80000"   # matches real measured qwen-code prompt s
 BENCH_MIN_SPEEDUP_PCT="10"          # candidate must beat baseline long-context gen tok/s by at least this %
 BENCH_MAX_ACCEPTANCE_DROP_PP="5"    # candidate's MTP draft-accept ratio must not fall more than this many percentage points vs baseline
 
-SERVED_MODEL_NAME="qwen3.8-27b"
+SERVED_MODEL_NAME="laguna-s-2.1"
 
 # --- Server ---
 HOST="0.0.0.0"
@@ -120,6 +156,14 @@ SERVER_HOST="127.0.0.1"
 # proportionally to preserve the same layered-defense ratios established
 # when this was 73728 (soft compaction trigger, then a hard backstop, both
 # comfortably below the real server limit).
+#
+# NOTE: the history above is about Qwen3.8-27B specifically (#27623 is a
+# Qwen-hybrid-architecture bug that doesn't apply to Laguna S 2.1 at all).
+# 131072 was independently re-verified for Laguna directly on this box
+# 2026-09-19: loads and serves correctly at this context, ~76GB/80GB GTT
+# used (~5.7GB headroom) — a real but not huge safety margin. Laguna's
+# native context is 1,048,576, far beyond what's been tested; treat
+# anything above 131072 as unverified for this model too.
 CTX_SIZE="131072"
 
 # CLIENT_CTX_SIZE: what we tell qwen-code via generationConfig.
@@ -161,15 +205,34 @@ QWEN_SESSION_TOKEN_LIMIT="114688"
 # `finish_reason: length` you can just ask to continue from.
 QWEN_CODE_MAX_OUTPUT_TOKENS="10000"
 
-# UBATCH_SIZE / BATCH_SIZE: mitigate llama.cpp#28211 (prompts longer than
-# n_ubatch get SILENTLY WRONG logits on HIP/gfx1151 — no crash, just bad
-# output). Raised well above the llama.cpp stock default of 512 to push the
+# UBATCH_SIZE / BATCH_SIZE:
+#
+# 2048 for Laguna S 2.1 (current default) — this model does NOT need the
+# large value below. Verified directly by hand 2026-09-19: a needle-in-
+# haystack test with a 4088-token prompt (well past 2048) correctly
+# retrieved an exact marker string with ubatch=2048, no corruption. Using
+# a smaller ubatch matters here specifically because compute-buffer
+# memory scales with ubatch size roughly independent of context length —
+# confirmed by hand: CTX_SIZE=131072 at ubatch=8192 used 81.4GB/82GB GTT
+# (446MB free — dangerously tight), while the SAME context at ubatch=2048
+# used only 77.2GB (4.7GB free). Full context AND safe headroom, simply
+# by not carrying over a Qwen-specific value that doesn't apply here.
+#
+# 8192 was for Qwen3.8-27B specifically: mitigates llama.cpp#28211
+# (prompts longer than n_ubatch get SILENTLY WRONG logits on HIP/gfx1151
+# — no crash, just bad output — for THAT model's architecture). Raised
+# well above the llama.cpp stock default of 512 to push the
 # silently-broken-output boundary past the overwhelming majority of real
-# chat/tool-calling prompts. This does NOT fix the upstream bug — it is
-# still open. Keep BATCH_SIZE == UBATCH_SIZE so there's no second, smaller,
-# invisible chunk boundary below the stated ceiling.
-UBATCH_SIZE="8192"
-BATCH_SIZE="8192"
+# chat/tool-calling prompts; does not fix the upstream bug, still open.
+# **If rolling back to Qwen3.8-27B, you MUST also set this back to 8192**
+# — Laguna's smaller value does not carry the same protection for Qwen's
+# architecture, and #28211 is a silent-corruption bug, not a crash, so a
+# forgotten rollback here would fail quietly.
+#
+# Keep BATCH_SIZE == UBATCH_SIZE so there's no second, smaller, invisible
+# chunk boundary below whichever ceiling is actually in effect.
+UBATCH_SIZE="2048"
+BATCH_SIZE="2048"
 
 # PARALLEL: mitigates lemonade-sdk#3160 (progressive generation corruption
 # under concurrent/sustained load on ROCm-nightly gfx1151, recovers only on
@@ -182,14 +245,14 @@ FLASH_ATTN="auto"       # GGML_HIP_ROCWMMA_FATTN is compiled OFF (see build
                          # flags in serve-qwen38.sh) due to llama.cpp#24437,
                          # so "auto" picks a safe generic kernel per layer.
 
-# SPEC_TYPE / SPEC_DRAFT_N_MAX: MTP speculative decoding, using the model's
-# own "nextn" tensors as a draft head (no separate draft model needed).
-# Confirmed by hand: real measured throughput went from ~7.4 tok/s to
-# ~14-20 tok/s (roughly 1.9-2.7x) on this exact model/quant/hardware,
-# output verified correct. Matches the flags already used by the
-# pre-existing Ollama deployment on this same box. Set SPEC_TYPE="" to
-# disable and fall back to plain decoding.
-SPEC_TYPE="draft-mtp"
+# SPEC_TYPE / SPEC_DRAFT_N_MAX: speculative decoding. SPEC_TYPE itself is
+# set once, up in the "Model source" section above (currently "" — no
+# working speculative-decoding path for the current default, Laguna S
+# 2.1; see that section for why). SPEC_DRAFT_N_MAX only matters when
+# SPEC_TYPE is non-empty. Left here for when Qwen3.8-27B's MTP mode
+# applies (draft-mtp, using the model's own "nextn" tensors as a draft
+# head, no separate draft model needed — confirmed by hand: went from
+# ~7.4 to ~14-20 tok/s, roughly 1.9-2.7x, on that model/quant/hardware).
 SPEC_DRAFT_N_MAX="4"
 
 # --- Security ---

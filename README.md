@@ -1,9 +1,14 @@
-# Qwen3.8-27B on AMD Strix Halo (gfx1151)
+# LLM inference on AMD Strix Halo (gfx1151)
 
-One-click deployment of **Qwen/Qwen3.8-27B** (Alibaba's Aug-2026 hybrid
-Gated-DeltaNet + full-attention dense VLM) via **llama.cpp / HIP**, serving
-an OpenAI-compatible endpoint for [qwen-code](https://github.com/QwenLM/qwen-code)
+One-click deployment of a local LLM via **llama.cpp / HIP**, serving an
+OpenAI-compatible endpoint for [qwen-code](https://github.com/QwenLM/qwen-code)
 or any other OpenAI-compatible client.
+
+**Current default: [Poolside Laguna S 2.1](https://huggingface.co/poolside/Laguna-S-2.1)**
+(118B total / 8B active MoE, conventional GQA + sliding-window attention,
+July 2026). Adopted 2026-09-19, replacing Qwen3.8-27B — see "Model history"
+below for the full story and why. Qwen3.8-27B remains available as a
+documented, working fallback (see "Rolling back to Qwen3.8-27B").
 
 Target hardware: an AMD Strix Halo APU (GPU arch **gfx1151**, e.g. Ryzen AI
 Max/Max+ 300 series), **96GB unified memory**, no dedicated VRAM.
@@ -12,6 +17,38 @@ This is the sibling of [AMD_MI210_Bunya_LLM_tools_Qwen3.8-27B](https://github.co
 rebuilt from scratch for a single-APU workstation instead of a SLURM/MI210
 cluster. It deliberately does **not** use SGLang or vLLM — see "Why
 llama.cpp" below.
+
+## Model history
+
+1. **Qwen3.8-27B** (original default) — a hybrid architecture with 48
+   Gated-DeltaNet (linear-attention) layers + 16 full-attention layers.
+   Worked, but this exotic architecture was the root cause of most pain
+   documented in this repo's history: an immature GPU kernel on gfx1151
+   (llama.cpp#20354, ~7-12 tok/s base rate, clawed back to ~14-23 tok/s
+   only via MTP speculative decoding), a decode-collapse risk at long
+   context (llama.cpp#27623), a silent-wrong-logits risk past `n_ubatch`
+   (llama.cpp#28211), and `qwen-code` client-side runaway-generation
+   incidents compounding the slowness. Quant was tuned (Q8_0 → Q5_K_M via
+   the `bench` subcommand) and context/output-limit safety nets were
+   built up considerably before the underlying architecture problem was
+   ever questioned.
+2. **Laguna S 2.1** (current default) — prompted by the user directly
+   asking whether Qwen3.8 was simply the wrong model for the hardware.
+   Research found the entire current Qwen line (3.5→3.8, including the
+   Qwen4 preview) has doubled down on the same hybrid-attention family,
+   so a newer Qwen wouldn't help; DeepSeek/GLM's large models use a
+   different but similarly-immature mechanism (DSA). Laguna S 2.1 was the
+   standout candidate that both avoids exotic-architecture risk *and*
+   fits this hardware's memory budget: confirmed by reading its
+   `laguna.cpp` in this repo's own llama.cpp checkout that it's built
+   entirely from the same shared `build_attn`/`build_moe_ffn` helpers
+   dozens of other well-supported models use — no novel op like
+   Gated-DeltaNet needed. Measured directly on this exact box: **~26
+   tok/s sustained, with NO speculative decoding at all** — already
+   faster than Qwen3.8-27B's best result, which needed MTP to get there.
+   Poolside's own DFlash speculative decoding was tried and hit a real,
+   reproducible bug in their fork (see "Known bugs" below) — not
+   adopted, but the un-accelerated baseline was already a clear win.
 
 ## Why llama.cpp (not SGLang, not vLLM)
 
@@ -24,82 +61,118 @@ llama.cpp" below.
   a predecessor model on gfx1151 but ran at ~4.2 tokens/sec — worse than
   llama.cpp's already-degraded number on this hardware.
 - **llama.cpp** is the only stack with both genuine upstream support for
-  this model's hybrid architecture and a real (if imperfect) gfx1151
-  backend.
+  these models' architectures and a real gfx1151 backend. Both Qwen3.8-27B
+  and Laguna S 2.1 load and serve correctly on mainline llama.cpp; the one
+  fork used in this repo's history (Poolside's, for DFlash) hit a real bug
+  and was not adopted — see below.
 
-## Known upstream bugs (this exact hardware + model combo)
+## Known bugs (this exact hardware, by model)
 
 This repo's defaults exist specifically to mitigate these. They are **not
 fixed**, just worked around — expect to rebuild against llama.cpp master
 periodically as fixes land upstream.
 
+**Laguna S 2.1 (current default):**
+
 | Issue | Symptom | This repo's mitigation |
 |---|---|---|
-| [llama.cpp#28211](https://github.com/ggml-org/llama.cpp/issues/28211) | HIP/gfx1151: prompts longer than `n_ubatch` get **silently wrong logits** (no crash) | `UBATCH_SIZE`/`BATCH_SIZE` default to 8192 (vs stock 512) — raises the ceiling, does not fix the bug |
-| [llama.cpp#27623](https://github.com/ggml-org/llama.cpp/issues/27623) | Upstream-reported ~25x decode collapse past ~80K KV tokens (other hardware/quants; issue still open) | **Retested directly on this exact build/quant 2026-09-18 — NOT reproduced** (sustained ~12-15 tok/s at ~97K context, see below). `CTX_SIZE` raised to 131072 accordingly; `serve` warns above 163840 (untested territory, not "known bad") |
-| [llama.cpp#20354](https://github.com/ggml-org/llama.cpp/issues/20354) | Gated-DeltaNet fused kernel runs on GPU on gfx1151 but performs no better than CPU fallback | Base rate is a performance ceiling, not fixable directly (~7-12 tok/s). Largely clawed back by MTP speculative decoding instead (`SPEC_TYPE=draft-mtp`, on by default) — measured **~14-20 tok/s**, ~1.9-2.7x, using the model's own draft head |
-| [llama.cpp#24437](https://github.com/ggml-org/llama.cpp/issues/24437) | `GGML_HIP_ROCWMMA_FATTN=ON` causes up to -41% prefill throughput on gfx1151 at 8K+ context, worsening with context length | Build compiles this flag **OFF** — a deliberate divergence from some "known-good Strix Halo" community recipes that set it ON |
-| [lemonade-sdk#3160](https://github.com/lemonade-sdk/lemonade/issues/3160) | Progressive generation corruption under sustained/concurrent load on ROCm-nightly gfx1151, recovers only on full reload | `PARALLEL=1` (single-slot serving) by default; use `restart` if output degrades, or `install-watchdog` for automated selftest-gated restarts |
+| Poolside `llama.cpp` fork (branch `laguna`), DFlash speculative decoding | Reproducibly hangs during draft-model memory measurement — `"dflash requires ctx_other to be set"` followed by a hang, not a clean failure. Tested with and without `-fa`, same result. A real bug in that fork, not a flag/config issue on our end | Not adopted. `SPEC_TYPE=""` — no speculative decoding for this model. The ~26 tok/s baseline (no spec decoding) already beats Qwen3.8-27B's best result, so this wasn't a blocker |
+
+No other known issues for Laguna S 2.1 on this hardware as of adoption —
+its conventional GQA + sliding-window architecture avoids the entire
+class of exotic-kernel problems below, which are all specific to
+Qwen3.8-27B's hybrid Gated-DeltaNet design.
+
+**Qwen3.8-27B (previous default, kept as documented fallback):**
+
+| Issue | Symptom | This repo's mitigation |
+|---|---|---|
+| [llama.cpp#28211](https://github.com/ggml-org/llama.cpp/issues/28211) | HIP/gfx1151: prompts longer than `n_ubatch` get **silently wrong logits** (no crash) | `UBATCH_SIZE`/`BATCH_SIZE` set to 8192 (vs stock 512) when running Qwen — raises the ceiling, does not fix the bug. **Laguna does not need this** (verified directly — see "Expected performance") and defaults to 2048 instead, which matters for memory headroom |
+| [llama.cpp#27623](https://github.com/ggml-org/llama.cpp/issues/27623) | Upstream-reported ~25x decode collapse past ~80K KV tokens (other hardware/quants; issue still open) | Retested directly on Qwen3.8-27B 2026-09-18 — NOT reproduced (sustained ~12-15 tok/s at ~97K context). `CTX_SIZE` raised to 131072 accordingly; `serve` warns above 163840 (untested territory, not "known bad") |
+| [llama.cpp#20354](https://github.com/ggml-org/llama.cpp/issues/20354) | Gated-DeltaNet fused kernel runs on GPU on gfx1151 but performs no better than CPU fallback | Base rate is a performance ceiling, not fixable directly (~7-12 tok/s). Largely clawed back by MTP speculative decoding instead (`SPEC_TYPE=draft-mtp`) — measured **~14-20 tok/s**, ~1.9-2.7x, using the model's own draft head |
+| [llama.cpp#24437](https://github.com/ggml-org/llama.cpp/issues/24437) | `GGML_HIP_ROCWMMA_FATTN=ON` causes up to -41% prefill throughput on gfx1151 at 8K+ context, worsening with context length | Build compiles this flag **OFF** for both models — a deliberate divergence from some "known-good Strix Halo" community recipes that set it ON |
+| [lemonade-sdk#3160](https://github.com/lemonade-sdk/lemonade/issues/3160) | Progressive generation corruption under sustained/concurrent load on ROCm-nightly gfx1151, recovers only on full reload | `PARALLEL=1` (single-slot serving) by default for both models; use `restart` if output degrades, or `install-watchdog` for automated selftest-gated restarts |
 
 ## Expected performance
 
-Base rate is in the ballpark of **~7-12 tokens/sec** on this hybrid
-architecture on gfx1151 (llama.cpp#20354 — the GPU kernel path doesn't beat
-CPU-fallback speed due to RDNA register-pressure/tuning gaps) — measured on
-this exact machine at Q8_0: prompt processing ~200-300 tok/s, generation a
-very consistent ~7.4 tok/s without speculative decoding.
+### Laguna S 2.1 (current default)
 
-**With `SPEC_TYPE=draft-mtp` (on by default)**, measured **~14-20 tok/s** —
-roughly 1.9-2.7x — using the model's own MTP "nextn" tensors as a draft
-head, no separate draft model needed. Output verified correct (coherent
-reasoning, correct final answers, clean `finish_reason: "stop"`) across
-multiple test prompts. This matches the flags already used by a
-pre-existing Ollama deployment found on this same box. Set `SPEC_TYPE=""`
-in `qwen38.env` to disable and fall back to plain decoding if you ever
-suspect it's causing an issue.
+Measured directly on this exact box, Q4_K_M, **no speculative decoding**
+(DFlash hits a real bug in Poolside's fork — see "Known bugs"): **~26
+tok/s sustained** across three separate generations (26.85 / 26.25 / 25.86
+tok/s), no degradation over long (3000-token) generations. Prompt
+processing similarly strong. Output verified correct: math, tool-calling
+(`finish_reason: "tool_calls"` with well-formed arguments), code
+generation, and a needle-in-haystack retrieval test at 4088 tokens of
+context (exact match, confirming no silent corruption at the ubatch
+boundary — see below).
 
-Either way, this is not comparable to dedicated-HBM datacenter cards
-(MI210/MI300-class). Capacity (96GB unified memory) is not the bottleneck
-here — kernel maturity on this specific GPU architecture is.
+This is already **faster than Qwen3.8-27B's best result**, which needed
+MTP speculative decoding just to reach 14-23 tok/s. Capacity was never
+the bottleneck on this hardware (96GB unified memory) — kernel maturity
+for a given model's architecture is, and Laguna's conventional
+attention avoids the whole class of problems Qwen3.8's hybrid
+architecture ran into here.
 
-**Default quant is Q5_K_M (adopted 2026-09-18 via `bench`), not Q8_0.**
-With MTP speculative decoding, measured **~16.1 tok/s on long-context /
-~21.7 tok/s on short prompts** (median of 3 reps each), a real +17.7%
-over Q8_0's ~13.7 tok/s baseline on the same hardware/config, with a
-*smaller* MTP draft-acceptance drop than the also-tested Q6_K (1.67
-percentage points vs Q6_K's 2.54) — both the speed and the
-draft-acceptance criteria favored Q5_K_M, not just its smaller size (see
-"Benchmarking alternate quants" below). Quality spot-checked by hand
-post-adoption (code generation, a math word problem) — correct, coherent,
-no degradation observed. Full results: `logs/bench/bench-20260918T055248Z*`.
+**`UBATCH_SIZE=2048` for Laguna, not Qwen's 8192.** Compute-buffer memory
+scales with ubatch size roughly independent of context length — at
+`CTX_SIZE=131072`, ubatch=8192 used 81.4GB/82GB GTT (446MB free,
+dangerously tight), while ubatch=2048 used only 77.2GB (4.7GB free) for
+the *same* context. Verified this doesn't reintroduce Qwen's
+silently-wrong-logits risk (llama.cpp#28211) for Laguna specifically: a
+4088-token prompt (well past 2048) correctly retrieved an exact marker
+string in a needle-in-haystack test, no corruption.
 
-**If you're using `qwen-code` specifically**: its full agentic mode sends a
-large system/tool-definition prompt (measured ~8,000-20,000+ tokens on this
-setup, depending on loaded skills/tools) and can make several sequential
-LLM round-trips per user turn (tool calls, reasoning steps), each
-reprocessing a large chunk of that context with only partial cache reuse.
-Even with MTP's speedup, a single interactive request can realistically
-take **several minutes** end-to-end — this was confirmed directly (a
-trivial "reply with one word" prompt took multiple sequential
-~40-80s round-trips before finishing). This is expected behavior on this
-hardware, not a hang — watch `./serve-qwen38.sh status` or tail
-`logs/qwen38.log` to confirm it's actively generating. `qwen --bare` skips
-auto-discovery/tool loading for a lighter, faster session if you don't need
-the full agentic toolset.
+### Qwen3.8-27B (previous default, if rolled back)
 
-**`wire-qwen-code` also caps a single turn's output** at
+Base rate ~7-12 tok/s (llama.cpp#20354 — the GPU kernel path doesn't beat
+CPU-fallback speed due to RDNA register-pressure/tuning gaps); measured
+~7.4 tok/s at Q8_0 without speculative decoding. With `SPEC_TYPE=draft-mtp`
+(the model's own MTP "nextn" tensors as a draft head, no separate draft
+model needed): **~14-20 tok/s**, roughly 1.9-2.7x. Default quant was tuned
+from Q8_0 to Q5_K_M via `bench` (+17.7% over Q8_0 baseline) — see
+"Benchmarking alternate quants". Full history and numbers in this
+section's git history if rolling back and want the details.
+
+### If you're using `qwen-code` (applies to either model)
+
+Its full agentic mode sends a large system/tool-definition prompt
+(measured ~8,000-20,000+ tokens on this setup, depending on loaded
+skills/tools) and can make several sequential LLM round-trips per user
+turn (tool calls, reasoning steps), each reprocessing a large chunk of
+that context with only partial cache reuse. Both models tested here also
+reason at length before answering (verbose `reasoning_content`, often
+consuming the whole token budget before reaching final `content`) — this
+is a model-behavior trait, not a bug, but it means real interactive
+requests take longer than raw tok/s alone suggests. Watch
+`./serve-qwen38.sh status` or tail `logs/qwen38.log` to confirm it's
+actively generating rather than stalled. `qwen --bare` skips
+auto-discovery/tool loading for a lighter, faster session if you don't
+need the full agentic toolset.
+
+**`wire-qwen-code` caps a single turn's output** at
 `QWEN_CODE_MAX_OUTPUT_TOKENS` (default 10,000) via
 `generationConfig.samplingParams.max_tokens`. Without this, `qwen-code`
 defaults to the model's *declared* output limit — effectively unbounded.
-Confirmed directly: a real turn generated 12,000+ tokens at a healthy,
-stable ~13.5 tok/s (no stall or corruption in the server logs) and was
+Confirmed directly (on Qwen3.8-27B, but the underlying `qwen-code`
+behavior is model-agnostic): a real turn generated 12,000+ tokens at a
+healthy, stable pace (no stall or corruption in the server logs) and was
 still going when `qwen-code`'s own 15-minute stream-lifetime cap
 (`QWEN_STREAM_MAX_LIFETIME_MS`, default 900000ms) killed the connection,
-discarding the entire in-flight response. Hitting the 10,000-token cap
-instead gives a clean `finish_reason: length` you can ask it to continue
-from, rather than losing the whole response to a timeout.
+discarding the entire in-flight response. Hitting the token cap instead
+gives a clean `finish_reason: length` you can ask it to continue from,
+rather than losing the whole response to a timeout.
 
 ## Benchmarking alternate quants
+
+**Note**: this section and the `bench` subcommand's `BENCH_QUANTS`/
+`BENCH_ALLOWED_QUANTS`/`BENCH_*_EXPECT_BYTES` config were built and tuned
+against Qwen3.8-27B's quant lineup (bartowski's `Q6_K`/`Q5_K_M`-style
+naming). The `bench` mechanism itself is model-agnostic — it always tests
+against whatever `MODEL_FILE` is currently configured — but those specific
+config values would need updating to bench alternate Laguna S 2.1 quants
+(different repo, different quant names: `UD-Q3_K_M`/`UD-Q4_K_M`/etc. via
+unsloth). Not yet done for Laguna as of adoption.
 
 **Why not FP8/BF8?** Ruled out, not implemented. gfx1151 (RDNA3.5) has
 zero native FP8/BF8 matrix-core acceleration — that's a CDNA3/CDNA4/RDNA4
@@ -189,7 +262,7 @@ file was deliberately kept.
 ./serve-qwen38.sh init          # dirs + API key
 ./serve-qwen38.sh probe         # GPU/ROCm/GTT preflight — read the warnings
 ./serve-qwen38.sh build         # clone+build llama.cpp from latest master
-./serve-qwen38.sh download      # fetch ~20.9GB Q5_K_M GGUF + mmproj
+./serve-qwen38.sh download      # fetch ~73.1GB Laguna S 2.1 Q4_K_M (3 shards, no mmproj)
 ./serve-qwen38.sh check         # bounded smoke-load test
 ./serve-qwen38.sh serve         # launch + wait for /health, prints connection banner
 ./serve-qwen38.sh wire-qwen-code   # point qwen-code CLI at this server
@@ -243,9 +316,14 @@ only, as was already done here.
 
 ### 2. GTT / kernel memory tuning
 
-Strix Halo has no fixed VRAM partition — the GPU claims system RAM
-dynamically via GTT. Without tuning, you'll be capped well below the
-nominal 96GB budget.
+**Applied on this box 2026-09-19** (was documented but deferred for weeks
+before that — worth doing early, not after you're already blocked on it
+by a model that needs the headroom). Strix Halo has no fixed VRAM
+partition — the GPU claims system RAM dynamically via GTT. Without
+tuning, you'll be capped well below the nominal 96GB budget: this box
+sat at a 47GB GTT ceiling (the driver's unconfigured ~50%-of-RAM default)
+for the entire Qwen3.8-27B phase of this repo's history, only becoming a
+real blocker once Laguna S 2.1's 73GB weights needed more room.
 
 ```bash
 sudoedit /etc/default/grub
@@ -366,6 +444,38 @@ If you change `CTX_SIZE`, `CLIENT_CTX_SIZE`, `QWEN_TOOL_OUTPUT_THRESHOLD`,
 `QWEN_TOOL_OUTPUT_LINES`, or `QWEN_SESSION_TOKEN_LIMIT`, rerun
 `wire-qwen-code` (on every machine running `qwen-code` against this
 server, laptops included) so the client's config stays in sync.
+
+## Rolling back to Qwen3.8-27B
+
+Laguna S 2.1 is the current default, but Qwen3.8-27B remains fully
+supported as a documented fallback — its weights are still on disk
+(`models/Qwen3.8-27B-Q5_K_M.gguf` + mmproj), nothing was deleted.
+
+1. Stop the server: `./serve-qwen38.sh stop`
+2. Edit `qwen38.env`:
+   - Comment out the active Laguna `MODEL_REPO`/`MODEL_FILE`/
+     `MODEL_FILE_EXTRA_SHARDS`/`MMPROJ_FILE`/`MODEL_FILE_EXPECT_BYTES`
+     lines in the "Model source" section.
+   - Uncomment the "Previous model (Qwen3.8-27B)" block right below them.
+   - Set `SPEC_TYPE="draft-mtp"` (Laguna's `SPEC_TYPE=""` has no draft
+     head for Qwen to use).
+   - Set `UBATCH_SIZE="8192"` and `BATCH_SIZE="8192"` (Laguna's `2048`
+     does **not** carry the same llama.cpp#28211 silent-corruption
+     protection for Qwen's architecture — this is not optional).
+   - Optionally lower `CTX_SIZE`/`CLIENT_CTX_SIZE`/`QWEN_SESSION_TOKEN_LIMIT`
+     back toward their Qwen-era values if memory is tight, though 131072
+     was independently verified safe for Qwen3.8-27B too (see "Expected
+     performance").
+3. `./serve-qwen38.sh serve`, then `selftest`.
+4. `./serve-qwen38.sh wire-qwen-code` (on every machine pointed at this
+   server, laptops included) — `SERVED_MODEL_NAME` needs to switch back
+   to `qwen3.8-27b` too, which is also in `qwen38.env`.
+5. Fully quit and restart any open `qwen` sessions (config changes here
+   only take effect on a fresh session, not a retry).
+
+No re-download needed either direction — both models' weights coexist on
+disk. Disk isn't a constraint on this box (3.5TB free as of this repo's
+last disk check).
 
 ## Client-only setup (a laptop or other machine that doesn't run the server)
 

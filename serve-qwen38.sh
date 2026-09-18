@@ -117,11 +117,22 @@ load_env() {
   # MTP speculative decoding, using the model's own "nextn" tensors as a
   # draft head (no separate draft model needed) — confirmed by hand: real
   # measured throughput went from ~7.4 tok/s to ~14-20 tok/s (roughly
-  # 1.9-2.7x) on this exact model/quant/hardware, output verified correct
+  # 1.9-2.7x) on Qwen3.8-27B specifically, output verified correct
   # (coherent reasoning, correct final answers, clean `finish_reason:
   # "stop"`). Matches the flags already used by the pre-existing Ollama
-  # deployment on this same box. Set SPEC_TYPE="" to disable.
-  SPEC_TYPE="${SPEC_TYPE:-draft-mtp}"
+  # deployment on this same box. Set SPEC_TYPE="" to disable — for models
+  # without an MTP-style draft head (e.g. Laguna S 2.1), this MUST be
+  # empty, not just left at the "draft-mtp" default.
+  #
+  # NOTE: `${SPEC_TYPE:-draft-mtp}` (colon-dash) would silently ignore an
+  # explicit empty string and fall back to "draft-mtp" anyway — bash
+  # treats "unset" and "set to empty" the same way under `:-`. Confirmed
+  # by hand this was a real, live bug: qwen38.env's `SPEC_TYPE=""` for
+  # Laguna S 2.1 (no MTP head at all) was silently being overridden back
+  # to "draft-mtp" until this was caught. `${SPEC_TYPE=draft-mtp}`
+  # (bare `=`, no colon) only fills in the default when the variable is
+  # truly unset, correctly preserving an explicit empty string.
+  : "${SPEC_TYPE=draft-mtp}"
   SPEC_DRAFT_N_MAX="${SPEC_DRAFT_N_MAX:-4}"
   SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-qwen3.8-27b}"
 
@@ -364,7 +375,24 @@ _download_gguf() {
 
 cmd_download() {
   _download_gguf "$MODEL_REPO" "$MODEL_FILE" "${MODEL_FILE_EXPECT_BYTES:-}"
-  _download_gguf "$MODEL_REPO" "$MMPROJ_FILE" "${MMPROJ_FILE_EXPECT_BYTES:-}"
+  # MODEL_FILE_EXTRA_SHARDS: comma-separated additional GGUF shard
+  # filenames for multi-part models (llama.cpp auto-detects sibling
+  # shards from MODEL_FILE's naming convention at load time — this just
+  # needs to fetch them). Empty/unset for single-file models.
+  if [[ -n "${MODEL_FILE_EXTRA_SHARDS:-}" ]]; then
+    local shard IFS_OLD=$IFS
+    IFS=','
+    for shard in $MODEL_FILE_EXTRA_SHARDS; do
+      IFS=$IFS_OLD
+      _download_gguf "$MODEL_REPO" "$shard" ""
+      IFS=','
+    done
+    IFS=$IFS_OLD
+  fi
+  # MMPROJ_FILE is optional — not every model has a vision tower.
+  if [[ -n "${MMPROJ_FILE:-}" ]]; then
+    _download_gguf "$MODEL_REPO" "$MMPROJ_FILE" "${MMPROJ_FILE_EXPECT_BYTES:-}"
+  fi
   log "download complete."
 }
 
@@ -482,14 +510,15 @@ cmd_serve() {
   cat <<EOF
 
 ================================================================
- Qwen3.8-27B is up.
+ ${SERVED_MODEL_NAME} is up.
    Base URL:    ${display_url}/v1
    Model alias: ${SERVED_MODEL_NAME}
    Ctx size:    ${CTX_SIZE} (qwen-code told: ${CLIENT_CTX_SIZE})   Ubatch: ${UBATCH_SIZE}   Parallel: ${PARALLEL}
    Speculative: ${SPEC_TYPE:-off}$( [[ -n "$SPEC_TYPE" ]] && echo " (draft-n-max ${SPEC_DRAFT_N_MAX})" )
-   Expect roughly ~14-20 tok/s with MTP speculative decoding on (measured;
-   ~7-12 tok/s without it — llama.cpp#20354, gfx1151 hybrid GDN kernel ties
-   CPU-fallback speed at the base rate). See README for details.
+   Real measured throughput on this box: Laguna S 2.1 ~26 tok/s (no spec
+   decoding — DFlash hits a bug in Poolside's fork, see README); Qwen3.8-27B
+   ~14-20 tok/s with MTP, ~7-12 tok/s without (llama.cpp#20354). See README
+   "Expected performance" for whichever model is actually configured.
 $( [[ "$SERVER_HOST" == "127.0.0.1" ]] && echo "   (SERVER_HOST is 127.0.0.1 — set it to this box's LAN IP in qwen38.env if other machines need to reach this server.)" )
 
  Smoke test:
