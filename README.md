@@ -95,12 +95,27 @@ The one real, working memory-tuning lever for this hardware class — GTT
 allocation boot params — is already applied (see "System prep" below).
 
 **`UBATCH_SIZE=2048`.** GPU compute-buffer memory scales with ubatch size
-roughly independent of context length — at `CTX_SIZE=131072`, ubatch=8192
-used 81.4GB/82GB GTT (446MB free, dangerously tight), while ubatch=2048
-used only 77.2GB (4.7GB free) for the *same* context. Verified this
-doesn't risk silently-wrong-logits behavior (llama.cpp#28211): a
-4088-token prompt (well past 2048) correctly retrieved an exact marker
-string in a needle-in-haystack test, no corruption.
+roughly independent of context length — at `CTX_SIZE=131072` (an earlier,
+lower value than the current default), ubatch=8192 used 81.4GB/82GB GTT
+(446MB free, dangerously tight), while ubatch=2048 used only 77.2GB
+(4.7GB free) for the *same* context. Verified this doesn't risk
+silently-wrong-logits behavior (llama.cpp#28211): a 4088-token prompt
+(well past 2048) correctly retrieved an exact marker string in a
+needle-in-haystack test, no corruption.
+
+**`CTX_SIZE=163840` — found empirically, not assumed.** Directly tested
+on this box 2026-09-19: 262144 (2x an earlier 131072 baseline) hard OOMs
+during KV-cache allocation; 196608 loads but leaves only ~1.4GB of GTT
+free (too tight by this repo's own standard); 163840 loads with a
+comfortable ~2.8GB free and was verified correct with a real ~130K-token
+needle-in-haystack prompt (exact marker retrieval, `finish_reason: stop`,
+14m18s end-to-end at this hardware's prefill speed for a prompt that
+long). Laguna's advertised native context (1,048,576) is real capability
+the *model* has — it is not evidence this *hardware's GPU memory* can
+serve anywhere near that much of it; 163840 is the actual tested ceiling
+here, a little over 15% of the advertised figure. `CLIENT_CTX_SIZE`
+(122,880) and `QWEN_SESSION_TOKEN_LIMIT` (143,360) are scaled from this
+new ceiling using the same ratios as before.
 
 ### If you're using `qwen-code`
 
@@ -271,7 +286,7 @@ proactively. Reporting the *exact* real `CTX_SIZE` isn't enough either —
 confirmed directly on this repo's earlier deployment: `qwen-code`'s own
 token counts are estimates, and a single large step can jump past its
 compaction trigger before compaction runs. `CLIENT_CTX_SIZE` is
-deliberately lower than `CTX_SIZE` (currently 98304 vs. 131072) — the gap
+deliberately lower than `CTX_SIZE` (currently 122880 vs. 163840) — the gap
 is the safety margin.
 
 **Even that margin isn't fully reliable on its own** — confirmed directly:
@@ -283,7 +298,7 @@ and `tools.truncateToolOutputLines` (lowered from qwen-code's stock 25,000
 chars / 1,000 lines to 8,000 / 300 — this bounds how much a single tool
 call can add; the stock default still let a *batch* of several fanned-out
 tool calls add up to more than the whole `CLIENT_CTX_SIZE` margin), and
-`model.sessionTokenLimit` (114,688 — a deterministic backstop that blocks
+`model.sessionTokenLimit` (143,360 — a deterministic backstop that blocks
 sending the next message outright once the recorded prompt is already over
 budget, independent of token-count estimation entirely). These require a
 fresh `qwen` session to take effect, not just a Ctrl+Y retry.
@@ -293,12 +308,22 @@ fresh `qwen` session to take effect, not just a Ctrl+Y retry.
 an earlier deployment: setting it below `CLIENT_CTX_SIZE` fired the hard
 block *before* proactive compaction ever got a chance to run, so every
 session hit a wall requiring manual `/compress`/`/clear` instead of
-compacting quietly. Current value (114,688) sits between `CLIENT_CTX_SIZE`
-(98,304, soft compaction trigger) and the real `CTX_SIZE` (131,072, hard
+compacting quietly. Current value (143,360) sits between `CLIENT_CTX_SIZE`
+(122,880, soft compaction trigger) and the real `CTX_SIZE` (163,840, hard
 server limit), functioning as a true last resort. If you see
 `Session token limit exceeded` from `qwen-code` itself, that's this
 backstop working as intended, not a bug — `/compress` or `/clear` as it
 suggests.
+
+**This backstop is a value to revisit, not a fact to accept.** Confirmed
+directly 2026-09-19: a real session hit `Session token limit exceeded:
+115,063 tokens > 114,688 limit` — a genuinely large session, not a bug —
+but the real `CTX_SIZE` at the time was 131,072, meaning 16,009 tokens of
+already-safe server capacity were sitting unused behind an artificial
+backstop that had simply never been revisited since it was first set. If
+you hit this error, before just starting a new session, check whether
+`QWEN_SESSION_TOKEN_LIMIT` actually has room to move up toward the real
+`CTX_SIZE` — it often does.
 
 We deliberately did **not** reach for llama-server's `--context-shift`
 here, even though it's designed for exactly this (discard old context

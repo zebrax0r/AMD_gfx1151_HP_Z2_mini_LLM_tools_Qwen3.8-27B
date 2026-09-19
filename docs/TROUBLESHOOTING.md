@@ -14,6 +14,30 @@ start unless `LD_LIBRARY_PATH` (or an `ld.so.conf.d` entry + `ldconfig`) is
 set explicitly. If you build other ROCm software outside this repo on this
 box, you'll hit the same thing.
 
+## `llama-server: error while loading shared libraries: libllama-server-impl.so: cannot open shared object file`
+
+Already handled by this script (`load_env` exports `LD_LIBRARY_PATH` to
+include this repo's own `vendor/llama.cpp/build/bin`), documented here in
+case you invoke the binary directly or still hit this. Real incident,
+2026-09-19: renaming this repo's directory
+(`qwen3.8_amd_gfx1151` -> `laguna_s21_amd_gfx1151`) broke `llama-server`
+outright with exactly this error, even though nothing about the actual
+build changed. Cause: cmake bakes an **absolute** `RUNPATH` into every
+binary/`.so` it produces at build time (confirmed via `readelf -d
+llama-server`) — e.g. `/home/zebra/Downloads/qwen3.8_amd_gfx1151/vendor/
+llama.cpp/build/bin`. Once that directory no longer exists, every binary
+that links against `libllama-server-impl.so`, `libggml-hip.so`, etc.
+fails to start, and a full rebuild (or manual `patchelf --set-rpath` on
+every affected binary) would otherwise be the only fix. Since these
+binaries use `RUNPATH` (not the older `RPATH`), the dynamic linker checks
+`LD_LIBRARY_PATH` **before** `RUNPATH` — so exporting the correct current
+`build/bin` path there overrides the stale baked-in one without a rebuild.
+If you ever move/rename this repo's directory by hand outside of `git mv`
+and hit a similar "cannot open shared object file" for one of this
+repo's own built `.so` files (as opposed to a system ROCm library), this
+is almost certainly why — check `readelf -d <binary> | grep -i path`
+first before assuming a rebuild is required.
+
 ## Garbled / wrong output on a very long single prompt
 
 Check `UBATCH_SIZE` in `laguna.env` (default 2048). This is the class of
@@ -123,7 +147,16 @@ behind the server — worth understanding in full if you hit it:
 If you see `Session token limit exceeded: N tokens > LIMIT limit` from
 `qwen-code` itself (not a server 400), that's this backstop working as
 designed, not a new bug — run `/compress` (preserves the session) or
-`/clear` (starts fresh) as it suggests.
+`/clear` (starts fresh) as it suggests. **But also check whether the
+backstop itself has room to move up first**: confirmed directly
+2026-09-19, a real session hit this at 115,063 tokens against a
+114,688 limit, while the real `CTX_SIZE` at the time was 131,072 —
+16,009 tokens of already-safe server capacity were sitting unused because
+`QWEN_SESSION_TOKEN_LIMIT` had simply never been revisited since it was
+first set. `grep -E "^CTX_SIZE=|^QWEN_SESSION_TOKEN_LIMIT="
+laguna.env`, and if there's real daylight between them, raise
+`QWEN_SESSION_TOKEN_LIMIT` (and `CLIENT_CTX_SIZE` proportionally) toward
+`CTX_SIZE` rather than immediately reaching for `/compress`/`/clear`.
 
 Why not just enable llama-server's `--context-shift` ("infinite"
 generation by discarding old context instead of hard-failing)? Its discard

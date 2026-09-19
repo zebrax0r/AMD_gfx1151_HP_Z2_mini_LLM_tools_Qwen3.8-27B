@@ -46,7 +46,18 @@ load_env() {
   # invocation fails with "cannot open shared object file". Confirmed by
   # hand: `LD_LIBRARY_PATH=/opt/rocm/lib llama-server --help` works,
   # unset it doesn't.
-  export LD_LIBRARY_PATH="${ROCM_PATH}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  #
+  # Also include this repo's own build/bin dir. cmake bakes an ABSOLUTE
+  # RUNPATH into every binary/.so at build time (e.g.
+  # /old/path/vendor/llama.cpp/build/bin) — confirmed by hand: renaming
+  # this repo's directory broke llama-server with "libllama-server-impl.so:
+  # cannot open shared object file", even though nothing about the build
+  # itself changed, purely because the baked-in absolute path no longer
+  # existed. These binaries use RUNPATH (not the older RPATH), which the
+  # dynamic linker searches AFTER LD_LIBRARY_PATH — so putting the correct
+  # current path here takes precedence and survives any future move/rename
+  # without needing a rebuild or `patchelf`.
+  export LD_LIBRARY_PATH="${SCRIPT_DIR}/${LLAMA_CPP_DIR}/build/bin:${ROCM_PATH}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
   HOST="${HOST:-0.0.0.0}"
   PORT="${PORT:-8000}"
   # SERVER_HOST is the address a CLIENT should use to reach this server —
@@ -57,7 +68,7 @@ load_env() {
   # `build`/`serve`) so `wire-qwen-code` and the `serve` banner print the
   # right address for that machine to use.
   SERVER_HOST="${SERVER_HOST:-127.0.0.1}"
-  CTX_SIZE="${CTX_SIZE:-131072}"
+  CTX_SIZE="${CTX_SIZE:-163840}"
   # CLIENT_CTX_SIZE is what we tell the qwen-code CLI harness via
   # generationConfig.contextWindowSize — deliberately LOWER than CTX_SIZE.
   # qwen-code's own token counts are estimates (its debug log literally logs
@@ -66,7 +77,7 @@ load_env() {
   # by hand: reporting the exact CTX_SIZE (65536, an earlier value) still
   # overshot to 68046 and hard-failed. The gap between CLIENT_CTX_SIZE and
   # CTX_SIZE is the safety margin that absorbs that slop.
-  CLIENT_CTX_SIZE="${CLIENT_CTX_SIZE:-98304}"
+  CLIENT_CTX_SIZE="${CLIENT_CTX_SIZE:-122880}"
   # These three cap how much a SINGLE turn can grow the conversation, which
   # matters more than CLIENT_CTX_SIZE's margin does: confirmed by hand that
   # a single turn (many fanned-out tool calls) can add tens of thousands of
@@ -95,7 +106,7 @@ load_env() {
   # together — see laguna-env.example for current values.
   QWEN_TOOL_OUTPUT_THRESHOLD="${QWEN_TOOL_OUTPUT_THRESHOLD:-8000}"
   QWEN_TOOL_OUTPUT_LINES="${QWEN_TOOL_OUTPUT_LINES:-300}"
-  QWEN_SESSION_TOKEN_LIMIT="${QWEN_SESSION_TOKEN_LIMIT:-114688}"
+  QWEN_SESSION_TOKEN_LIMIT="${QWEN_SESSION_TOKEN_LIMIT:-143360}"
   # Caps a single turn's generated tokens. Without this, qwen-code defaults
   # to the model's *declared* output limit — effectively unbounded here.
   # Confirmed by hand: a real turn generated 12,000+ tokens at a healthy,
@@ -461,7 +472,7 @@ cmd_serve() {
   mkdir -p "$LOG_DIR"
 
   [[ "$PARALLEL" -le 1 ]] || warn "PARALLEL=$PARALLEL (>1). This raises exposure to lemonade-sdk#3160 (progressive corruption under concurrent load). Consider 'install-watchdog'."
-  [[ "$CTX_SIZE" -le 163840 ]] || warn "CTX_SIZE=$CTX_SIZE (>163840). Verified safe at 131072 on this exact build/quant as of 2026-09-19 (~76GB/80GB GTT used at load). Above that hasn't been directly tested, even though native context is 1,048,576."
+  [[ "$CTX_SIZE" -le 163840 ]] || warn "CTX_SIZE=$CTX_SIZE (>163840). Verified safe at 163840 on this exact build/quant as of 2026-09-19 (~79GB/80GB GTT used at load, ~2.8GB free). 196608 loads but leaves only ~1.4GB free; 262144 hard OOMs during KV-cache allocation. Treat anything above 163840 as unverified and likely memory-tight, even though native context is 1,048,576 — retest with amd-smi + a needle-in-haystack check before trusting a higher value."
 
   _build_server_args "$MODEL_FILE"
 

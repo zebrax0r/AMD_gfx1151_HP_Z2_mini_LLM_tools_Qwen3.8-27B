@@ -69,18 +69,26 @@ PORT="8000"
 # set this to the server machine's LAN IP or hostname instead.
 SERVER_HOST="127.0.0.1"
 
-# CTX_SIZE: 131072, verified directly on this exact box 2026-09-19 —
-# loads and serves correctly at this context, ~76GB/80GB GTT used at load
-# time (~5.7GB headroom, a real but not huge safety margin). Laguna's
-# native context is 1,048,576, far beyond what's been tested here; treat
-# anything above 131072 as unverified. `serve` warns (does not block)
-# above 163840.
+# CTX_SIZE: 163840, verified directly on this exact box 2026-09-19 via a
+# real ~130K-token prompt (needle-in-haystack: exact marker retrieval,
+# finish_reason: stop, no corruption) — ~79GB/80GB GTT used at load time
+# (~2.8GB headroom, a real but not huge safety margin). This value was
+# chosen empirically, not just doubled/assumed: 196608 loads but leaves
+# only ~1.4GB GTT free (too tight by this repo's own standard elsewhere),
+# and 262144 hard OOMs during KV-cache allocation
+# (`cudaMalloc failed: out of memory`, `failed to allocate buffer for kv
+# cache`) even though the model itself claims a 1,048,576-token native
+# context. Treat anything above 163840 as unverified and likely tight on
+# memory on this exact box/quant — if you want to push further, retest
+# with amd-smi headroom checks and a needle-in-haystack correctness test
+# the same way, don't just raise the number. `serve` warns (does not
+# block) above 163840.
 #
-# CLIENT_CTX_SIZE/QWEN_SESSION_TOKEN_LIMIT below are scaled down from
-# CTX_SIZE proportionally, preserving layered-defense margins (soft
-# compaction trigger, then a hard backstop, both comfortably below the
-# real server limit).
-CTX_SIZE="131072"
+# CLIENT_CTX_SIZE/QWEN_SESSION_TOKEN_LIMIT below are scaled from CTX_SIZE
+# proportionally (same ratios as the 131072-era config), preserving
+# layered-defense margins (soft compaction trigger, then a hard backstop,
+# both comfortably below the real server limit).
+CTX_SIZE="163840"
 
 # CLIENT_CTX_SIZE: what we tell the qwen-code CLI harness via
 # generationConfig.contextWindowSize — deliberately LOWER than CTX_SIZE,
@@ -93,7 +101,7 @@ CTX_SIZE="131072"
 # margin was fully blown through in one turn (see QWEN_TOOL_OUTPUT_THRESHOLD
 # below for the fix that actually addresses the root cause, not just this
 # symptom).
-CLIENT_CTX_SIZE="98304"
+CLIENT_CTX_SIZE="122880"
 
 # QWEN_TOOL_OUTPUT_THRESHOLD / QWEN_TOOL_OUTPUT_LINES / QWEN_SESSION_TOKEN_LIMIT:
 # written into qwen-code's global settings.json (tools.truncateToolOutputThreshold/
@@ -106,9 +114,18 @@ CLIENT_CTX_SIZE="98304"
 # once the recorded prompt is already over budget, independent of qwen-code's
 # (unreliable) token-count estimation. Requires a fresh `qwen` session to
 # take effect, not just a retry.
+#
+# 143360 (2026-09-19, scaled with the CTX_SIZE bump to 163840): the
+# previous value (114688, set when CTX_SIZE was 131072) fired at 115,063
+# tokens — a real session that had genuinely grown large, not a bug — but
+# left 16,009 tokens of the real CTX_SIZE ceiling completely unused
+# because the backstop was never revisited after being set once. Don't
+# just treat "hit the backstop" as "start a new session" without first
+# checking whether the backstop itself has room to move up toward the
+# real server limit.
 QWEN_TOOL_OUTPUT_THRESHOLD="8000"
 QWEN_TOOL_OUTPUT_LINES="300"
-QWEN_SESSION_TOKEN_LIMIT="114688"
+QWEN_SESSION_TOKEN_LIMIT="143360"
 
 # QWEN_CODE_MAX_OUTPUT_TOKENS: caps a single turn's generated tokens.
 # Without this, qwen-code defaults to the model's *declared* output limit —
