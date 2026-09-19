@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# One-click Qwen3.8-27B server for AMD Strix Halo (gfx1151), via llama.cpp/HIP.
+# One-click Laguna S 2.1 server for AMD Strix Halo (gfx1151), via llama.cpp/HIP.
 # See README.md and docs/TROUBLESHOOTING.md for context on every default here.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-ENV_FILE="qwen38.env"
-ENV_EXAMPLE="qwen38-env.example"
+ENV_FILE="laguna.env"
+ENV_EXAMPLE="laguna-env.example"
 
 # ---------------------------------------------------------------- helpers --
 
@@ -53,19 +53,19 @@ load_env() {
   # distinct from HOST above, which is the bind address `serve` listens on.
   # Leave as 127.0.0.1 when running this script on the same machine as the
   # server. Set to this box's LAN IP/hostname in a *client-only* copy of
-  # qwen38.env (e.g. a laptop that only runs `wire-qwen-code`, never
+  # laguna.env (e.g. a laptop that only runs `wire-qwen-code`, never
   # `build`/`serve`) so `wire-qwen-code` and the `serve` banner print the
   # right address for that machine to use.
   SERVER_HOST="${SERVER_HOST:-127.0.0.1}"
   CTX_SIZE="${CTX_SIZE:-131072}"
-  # CLIENT_CTX_SIZE is what we tell qwen-code via generationConfig.
-  # contextWindowSize — deliberately LOWER than CTX_SIZE. qwen-code's own
-  # token counts are estimates (its debug log literally logs
+  # CLIENT_CTX_SIZE is what we tell the qwen-code CLI harness via
+  # generationConfig.contextWindowSize — deliberately LOWER than CTX_SIZE.
+  # qwen-code's own token counts are estimates (its debug log literally logs
   # `estimated=true`), and a single large step (e.g. one big tool result)
   # can jump past its compaction trigger before compaction runs. Confirmed
-  # by hand: reporting the exact CTX_SIZE (65536) still overshot to 68046
-  # and hard-failed. The gap between CLIENT_CTX_SIZE and CTX_SIZE is the
-  # safety margin that absorbs that slop.
+  # by hand: reporting the exact CTX_SIZE (65536, an earlier value) still
+  # overshot to 68046 and hard-failed. The gap between CLIENT_CTX_SIZE and
+  # CTX_SIZE is the safety margin that absorbs that slop.
   CLIENT_CTX_SIZE="${CLIENT_CTX_SIZE:-98304}"
   # These three cap how much a SINGLE turn can grow the conversation, which
   # matters more than CLIENT_CTX_SIZE's margin does: confirmed by hand that
@@ -78,85 +78,68 @@ load_env() {
   # blocks sending the next message outright once the recorded prompt
   # count is already over the limit, rather than sending and hard-failing
   # server-side. NOT applied via context-shift server-side (deliberately
-  # rejected — see README: recurrent/hybrid memory can't be partially
-  # truncated, risking corruption, not just a performance hit).
+  # rejected — see README: some hybrid/recurrent architectures can't have
+  # their memory partially truncated safely, and this repo doesn't assume
+  # that risk is absent just because Laguna uses conventional attention).
   #
   # ORDERING MATTERS: QWEN_SESSION_TOKEN_LIMIT must be HIGHER than
   # CLIENT_CTX_SIZE, not lower. Confirmed by hand getting this wrong: an
-  # initial 50000 (below CLIENT_CTX_SIZE=57344) made the hard block fire
-  # *before* qwen-code's own proactive compaction ever got a chance to run
+  # initial value below CLIENT_CTX_SIZE made the hard block fire *before*
+  # qwen-code's own proactive compaction ever got a chance to run
   # automatically — every session just hit a wall requiring manual
   # /compress or /clear instead of compacting quietly in the background.
   # The intended layering is: CLIENT_CTX_SIZE triggers soft automatic
   # compaction first; QWEN_SESSION_TOKEN_LIMIT is a true last-resort hard
   # stop, comfortably below the real CTX_SIZE so it still catches a
   # runaway single turn before that hits the server. Numbers scale
-  # together — see qwen38-env.example for current values and the
-  # 2026-09-18 CTX_SIZE history (this ordering rule doesn't change with
-  # the absolute numbers, only their ratios).
+  # together — see laguna-env.example for current values.
   QWEN_TOOL_OUTPUT_THRESHOLD="${QWEN_TOOL_OUTPUT_THRESHOLD:-8000}"
   QWEN_TOOL_OUTPUT_LINES="${QWEN_TOOL_OUTPUT_LINES:-300}"
   QWEN_SESSION_TOKEN_LIMIT="${QWEN_SESSION_TOKEN_LIMIT:-114688}"
   # Caps a single turn's generated tokens. Without this, qwen-code defaults
   # to the model's *declared* output limit — effectively unbounded here.
   # Confirmed by hand: a real turn generated 12,000+ tokens at a healthy,
-  # stable ~13.5 tok/s (server logs show no stall/corruption) and was still
-  # going when qwen-code's own 15-minute stream-lifetime cap
+  # stable pace (server logs show no stall/corruption) and was still going
+  # when qwen-code's own 15-minute stream-lifetime cap
   # (QWEN_STREAM_MAX_LIFETIME_MS, default 900000ms) killed the connection —
   # discarding the entire in-flight response instead of truncating cleanly.
-  # 10000 tokens / ~13.5 tok/s (low end of measured range) ≈ 12.3 min,
-  # comfortable margin under 15 min; hitting it gives a clean
-  # `finish_reason: length` you can just ask to continue from, rather than
-  # losing the whole response to a timeout.
+  # 10000 tokens at this hardware's measured throughput gives a comfortable
+  # margin under 15 min; hitting it gives a clean `finish_reason: length`
+  # you can just ask to continue from, rather than losing the whole
+  # response to a timeout.
   QWEN_CODE_MAX_OUTPUT_TOKENS="${QWEN_CODE_MAX_OUTPUT_TOKENS:-10000}"
-  UBATCH_SIZE="${UBATCH_SIZE:-8192}"
-  BATCH_SIZE="${BATCH_SIZE:-8192}"
+  # 2048 verified directly by hand: a needle-in-haystack test with a
+  # 4088-token prompt (well past 2048) correctly retrieved an exact marker
+  # string, no corruption. Kept modest deliberately — GPU compute-buffer
+  # memory scales with ubatch size roughly independent of context length,
+  # confirmed by hand: CTX_SIZE=131072 at ubatch=8192 used 81.4GB/82GB GTT
+  # (446MB free — dangerously tight), while the SAME context at ubatch=2048
+  # used only 77.2GB (4.7GB free). If you see garbled output on a very long
+  # single prompt, llama.cpp#28211 (HIP/gfx1151: prompts longer than
+  # n_ubatch can get silently wrong logits, upstream, still open) is worth
+  # checking — raise this and re-run a needle-in-haystack test rather than
+  # assuming any given value is safe untested.
+  UBATCH_SIZE="${UBATCH_SIZE:-2048}"
+  BATCH_SIZE="${BATCH_SIZE:-2048}"
   PARALLEL="${PARALLEL:-1}"
   GPU_LAYERS="${GPU_LAYERS:-999}"
   FLASH_ATTN="${FLASH_ATTN:-auto}"
-  # MTP speculative decoding, using the model's own "nextn" tensors as a
-  # draft head (no separate draft model needed) — confirmed by hand: real
-  # measured throughput went from ~7.4 tok/s to ~14-20 tok/s (roughly
-  # 1.9-2.7x) on Qwen3.8-27B specifically, output verified correct
-  # (coherent reasoning, correct final answers, clean `finish_reason:
-  # "stop"`). Matches the flags already used by the pre-existing Ollama
-  # deployment on this same box. Set SPEC_TYPE="" to disable — for models
-  # without an MTP-style draft head (e.g. Laguna S 2.1), this MUST be
-  # empty, not just left at the "draft-mtp" default.
-  #
-  # NOTE: `${SPEC_TYPE:-draft-mtp}` (colon-dash) would silently ignore an
-  # explicit empty string and fall back to "draft-mtp" anyway — bash
-  # treats "unset" and "set to empty" the same way under `:-`. Confirmed
-  # by hand this was a real, live bug: qwen38.env's `SPEC_TYPE=""` for
-  # Laguna S 2.1 (no MTP head at all) was silently being overridden back
-  # to "draft-mtp" until this was caught. `${SPEC_TYPE=draft-mtp}`
-  # (bare `=`, no colon) only fills in the default when the variable is
-  # truly unset, correctly preserving an explicit empty string.
-  : "${SPEC_TYPE=draft-mtp}"
+  # Speculative decoding: no working path currently. This model has no
+  # MTP-style "nextn" draft head, and Poolside's own DFlash mechanism needs
+  # their llama.cpp fork (branch `laguna`), which hits a reproducible hang
+  # — see docs/TROUBLESHOOTING.md. Left empty by default; SPEC_DRAFT_N_MAX
+  # only matters once SPEC_TYPE is non-empty (e.g. if DFlash's fork bug
+  # gets fixed upstream).
+  SPEC_TYPE="${SPEC_TYPE:-}"
   SPEC_DRAFT_N_MAX="${SPEC_DRAFT_N_MAX:-4}"
-  SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-qwen3.8-27b}"
-
-  # bench subcommand config — see qwen38-env.example for full rationale
-  # (FP8/BF8 ruled out; Q4_K_M-and-below hard-blocked given MTP
-  # draft-acceptance-collapse risk). Fallbacks here so `bench` still works
-  # safely even if qwen38.env predates this addition (git pull without a
-  # manual re-sync, an established gap in this repo's config pattern).
-  BENCH_QUANTS="${BENCH_QUANTS:-Q6_K,Q5_K_M}"
-  BENCH_ALLOWED_QUANTS="${BENCH_ALLOWED_QUANTS:-Q8_0,Q6_K,Q6_K_L,Q5_K_M,Q5_K_L,Q5_1,Q5_0}"
-  BENCH_Q6_K_EXPECT_BYTES="${BENCH_Q6_K_EXPECT_BYTES:-23860565728}"
-  BENCH_Q5_K_M_EXPECT_BYTES="${BENCH_Q5_K_M_EXPECT_BYTES:-20923877088}"
-  BENCH_GEN_TOKENS="${BENCH_GEN_TOKENS:-512}"
-  BENCH_REPEATS="${BENCH_REPEATS:-3}"
-  BENCH_LONG_PROMPT_MIN_CHARS="${BENCH_LONG_PROMPT_MIN_CHARS:-80000}"
-  BENCH_MIN_SPEEDUP_PCT="${BENCH_MIN_SPEEDUP_PCT:-10}"
-  BENCH_MAX_ACCEPTANCE_DROP_PP="${BENCH_MAX_ACCEPTANCE_DROP_PP:-5}"
+  SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-laguna-s-2.1}"
 
   BUILD_DIR="$LLAMA_CPP_DIR/build"
   LLAMA_SERVER_BIN="$BUILD_DIR/bin/llama-server"
   LLAMA_CLI_BIN="$BUILD_DIR/bin/llama-cli"
-  PID_FILE="$LOG_DIR/qwen38.pid"
-  SERVER_LOG="$LOG_DIR/qwen38.log"
-  STDOUT_LOG="$LOG_DIR/qwen38.stdout.log"
+  PID_FILE="$LOG_DIR/laguna.pid"
+  SERVER_LOG="$LOG_DIR/laguna.log"
+  STDOUT_LOG="$LOG_DIR/laguna.stdout.log"
   BUILD_INFO="$LOG_DIR/build-info.txt"
   API_KEY_FILE="$SECRETS_DIR/api_key"
 
@@ -231,23 +214,12 @@ cmd_probe() {
 
   echo "== Known upstream bugs baked into this script's defaults =="
   cat <<'EOF'
-  - llama.cpp#28211: HIP/gfx1151 gives silently WRONG logits on prompts
-    longer than n_ubatch. Mitigation: UBATCH_SIZE/BATCH_SIZE default 8192
-    (not a fix, just a much higher ceiling before the bug bites).
-  - llama.cpp#27623: upstream-reported ~25x decode collapse past ~80K KV
-    position on this hybrid Gated-DeltaNet architecture (other
-    hardware/quants; issue still open, unfixed). Retested directly on
-    THIS exact build/quant/config 2026-09-18: sustained ~12-15 tok/s
-    decode at ~97K context, no collapse observed. Not reproduced here, but
-    not a guarantee it can't recur (different build, different prompt
-    shape, near the 262144 native ceiling) — re-verify after any
-    ./serve-qwen38.sh update. CTX_SIZE defaults to 131072 accordingly.
-  - llama.cpp#20354: the Gated-DeltaNet fused kernel runs on GPU on gfx1151
-    but performs no better than CPU fallback (RDNA register-pressure/tuning
-    gaps). Base rate ~7-12 tokens/sec; MTP speculative decoding (on by
-    default, SPEC_TYPE=draft-mtp) measured at ~14-20 tokens/sec on this
-    exact model/quant/hardware. Not comparable to dedicated-HBM (MI210-
-    class) numbers either way.
+  - llama.cpp#28211: HIP/gfx1151 has an upstream report of prompts longer
+    than n_ubatch getting silently WRONG logits (no crash). Verified NOT
+    reproduced on this exact model/build at UBATCH_SIZE=2048 up to 4088
+    tokens tested (needle-in-haystack, exact retrieval) — if you see
+    garbled output on a much longer single prompt, raise UBATCH_SIZE/
+    BATCH_SIZE and re-verify with the same kind of test.
   - llama.cpp#24437: GGML_HIP_ROCWMMA_FATTN causes up to -41% prefill
     throughput on gfx1151 at 8K+ context, worsening with context length.
     This build compiles it OFF (a deliberate divergence from some
@@ -257,6 +229,9 @@ cmd_probe() {
     Mitigation: PARALLEL defaults to 1 (single-slot serving); use
     `restart` if output degrades, or `install-watchdog` for automated
     selftest-gated restarts.
+  - Poolside's llama.cpp fork (branch `laguna`), DFlash speculative
+    decoding: reproducibly hangs at startup ("dflash requires ctx_other to
+    be set" then hangs). Not adopted — see README/TROUBLESHOOTING.
 EOF
 
   [[ "$blocking" -eq 0 ]] || die "probe found a blocking issue (see ROCm section above)."
@@ -341,12 +316,9 @@ _hf_bin() {
   echo "$venv_dir/bin/hf"
 }
 
-# _download_gguf <repo> <file> [expect_bytes]
-# Shared by cmd_download (MODEL_FILE/MMPROJ_FILE) and cmd_bench (candidate
-# quants) — disk preflight, hf download (resumable/idempotent — skips
-# already-complete files), size-sanity warning. Extracted so there's only
-# one place that knows how to fetch a GGUF file from this repo's model
-# source, not one copy per caller.
+# _download_gguf <repo> <file> [expect_bytes>
+# disk preflight, hf download (resumable/idempotent — skips already-complete
+# files), size-sanity warning.
 _download_gguf() {
   local repo="$1" file="$2" expect_bytes="${3:-}"
   local hf_bin; hf_bin="$(_hf_bin)"
@@ -378,7 +350,7 @@ cmd_download() {
   # MODEL_FILE_EXTRA_SHARDS: comma-separated additional GGUF shard
   # filenames for multi-part models (llama.cpp auto-detects sibling
   # shards from MODEL_FILE's naming convention at load time — this just
-  # needs to fetch them). Empty/unset for single-file models.
+  # needs to fetch them). Laguna S 2.1 ships as 3 shards.
   if [[ -n "${MODEL_FILE_EXTRA_SHARDS:-}" ]]; then
     local shard IFS_OLD=$IFS
     IFS=','
@@ -389,7 +361,7 @@ cmd_download() {
     done
     IFS=$IFS_OLD
   fi
-  # MMPROJ_FILE is optional — not every model has a vision tower.
+  # MMPROJ_FILE is optional — Laguna S 2.1 is not multimodal, left unset.
   if [[ -n "${MMPROJ_FILE:-}" ]]; then
     _download_gguf "$MODEL_REPO" "$MMPROJ_FILE" "${MMPROJ_FILE_EXPECT_BYTES:-}"
   fi
@@ -428,12 +400,6 @@ _detect_flag() {
 }
 
 # _build_server_args <model_file> -> populates global SERVER_ARGS()
-# Shared by cmd_serve and cmd_bench so there is exactly one place that
-# knows how to build a llama-server invocation — bench can never
-# accidentally test a quant with a different flag set (e.g. MTP
-# speculative decoding silently off) than what production actually runs,
-# which would invalidate the whole point of bench-testing for
-# draft-acceptance collapse. Only --model varies by caller.
 _build_server_args() {
   local model_file="$1"
   SERVER_ARGS=(
@@ -449,7 +415,7 @@ _build_server_args() {
     --jinja
     --log-file "$SERVER_LOG"
   )
-  [[ -f "$MODEL_DIR/$MMPROJ_FILE" ]] && SERVER_ARGS+=(--mmproj "$MODEL_DIR/$MMPROJ_FILE")
+  [[ -n "${MMPROJ_FILE:-}" && -f "$MODEL_DIR/$MMPROJ_FILE" ]] && SERVER_ARGS+=(--mmproj "$MODEL_DIR/$MMPROJ_FILE")
 
   # Feature-detect flags whose names/semantics have churned on a fast-moving
   # master branch, rather than hardcoding and risking a startup failure.
@@ -464,7 +430,7 @@ _build_server_args() {
   fi
 }
 
-# _wait_healthy <pid> — shared by cmd_serve and cmd_bench.
+# _wait_healthy <pid>
 _wait_healthy() {
   local pid="$1"
   # Health-check polling always targets loopback — it's this machine
@@ -495,7 +461,7 @@ cmd_serve() {
   mkdir -p "$LOG_DIR"
 
   [[ "$PARALLEL" -le 1 ]] || warn "PARALLEL=$PARALLEL (>1). This raises exposure to lemonade-sdk#3160 (progressive corruption under concurrent load). Consider 'install-watchdog'."
-  [[ "$CTX_SIZE" -le 163840 ]] || warn "CTX_SIZE=$CTX_SIZE (>163840). Directly tested and safe up to ~97K on this exact build/quant as of 2026-09-18 (see llama.cpp#27623 in probe's known-bugs summary), but that's the limit of what's actually been verified — territory above this hasn't been tested, and the model's native context tops out at 262144."
+  [[ "$CTX_SIZE" -le 163840 ]] || warn "CTX_SIZE=$CTX_SIZE (>163840). Verified safe at 131072 on this exact build/quant as of 2026-09-19 (~76GB/80GB GTT used at load). Above that hasn't been directly tested, even though native context is 1,048,576."
 
   _build_server_args "$MODEL_FILE"
 
@@ -515,11 +481,11 @@ cmd_serve() {
    Model alias: ${SERVED_MODEL_NAME}
    Ctx size:    ${CTX_SIZE} (qwen-code told: ${CLIENT_CTX_SIZE})   Ubatch: ${UBATCH_SIZE}   Parallel: ${PARALLEL}
    Speculative: ${SPEC_TYPE:-off}$( [[ -n "$SPEC_TYPE" ]] && echo " (draft-n-max ${SPEC_DRAFT_N_MAX})" )
-   Real measured throughput on this box: Laguna S 2.1 ~26 tok/s (no spec
-   decoding — DFlash hits a bug in Poolside's fork, see README); Qwen3.8-27B
-   ~14-20 tok/s with MTP, ~7-12 tok/s without (llama.cpp#20354). See README
-   "Expected performance" for whichever model is actually configured.
-$( [[ "$SERVER_HOST" == "127.0.0.1" ]] && echo "   (SERVER_HOST is 127.0.0.1 — set it to this box's LAN IP in qwen38.env if other machines need to reach this server.)" )
+   Real measured throughput on this box: ~26 tok/s sustained, no
+   speculative decoding (DFlash hits a bug in Poolside's fork — see
+   README/TROUBLESHOOTING). GPU confirmed at 96-100% activity, ~97.6%
+   of max clock, zero throttling during generation.
+$( [[ "$SERVER_HOST" == "127.0.0.1" ]] && echo "   (SERVER_HOST is 127.0.0.1 — set it to this box's LAN IP in laguna.env if other machines need to reach this server.)" )
 
  Smoke test:
    curl ${display_url}/v1/chat/completions \\
@@ -567,212 +533,6 @@ cmd_stop() {
 
 cmd_restart() { cmd_stop; cmd_serve; }
 
-# _bench_quant_file <label> -> echoes the GGUF filename for a bench label.
-# Bartowski's repo (our MODEL_REPO) names sibling quants of this model
-# consistently as Qwen3.8-27B-<QUANT>.gguf — same pattern as our own
-# MODEL_FILE (Qwen3.8-27B-Q8_0.gguf) — so no per-quant lookup table is
-# needed beyond this.
-_bench_quant_file() { echo "Qwen3.8-27B-$1.gguf"; }
-
-# _bench_quant_expect_bytes <label> -> echoes the confirmed expected byte
-# size for a bench label, or empty if unknown (download proceeds, just
-# without the sanity-check warning). Real sizes must be confirmed via HEAD
-# request against the actual repo before adding a case here — see
-# qwen38-env.example's BENCH_*_EXPECT_BYTES comment for how these two were
-# obtained. Do not guess.
-_bench_quant_expect_bytes() {
-  case "$1" in
-    Q6_K) echo "$BENCH_Q6_K_EXPECT_BYTES" ;;
-    Q5_K_M) echo "$BENCH_Q5_K_M_EXPECT_BYTES" ;;
-    *) echo "" ;;
-  esac
-}
-
-# _bench_long_prompt -> prints a long prompt built by repeating
-# bench/prompts/short.txt until it exceeds BENCH_LONG_PROMPT_MIN_CHARS,
-# cached under logs/bench/ so repeated bench runs are reproducible without
-# committing a large file to git.
-_bench_long_prompt() {
-  local cache="$LOG_DIR/bench/.longprompt-cache"
-  if [[ ! -f "$cache" ]]; then
-    mkdir -p "$(dirname "$cache")"
-    local seed content=""
-    seed="$(cat bench/prompts/short.txt)"
-    while [[ "${#content}" -lt "$BENCH_LONG_PROMPT_MIN_CHARS" ]]; do
-      content+="$seed"$'\n\n'
-    done
-    printf '%s' "$content" > "$cache"
-  fi
-  cat "$cache"
-}
-
-# _bench_request <prompt_content> -> prints the raw JSON response, or
-# nothing (with a warning already emitted) on failure. temperature=0
-# removes sampling variance from the comparison and lets output be
-# spot-checked for coherence across quants essentially for free.
-_bench_request() {
-  local prompt_content="$1"
-  local max_time=$(( BENCH_GEN_TOKENS / 3 + 60 ))  # pessimistic ~3 tok/s floor + fixed buffer, same spirit as cmd_check's timeout
-  local payload
-  payload="$(jq -n --arg content "$prompt_content" --argjson max_tokens "$BENCH_GEN_TOKENS" --arg model "$SERVED_MODEL_NAME" \
-    '{model: $model, messages: [{role: "user", content: $content}], max_tokens: $max_tokens, temperature: 0, stream: false}')"
-  curl -sf --max-time "$max_time" "http://127.0.0.1:${PORT}/v1/chat/completions" \
-    -H "Authorization: Bearer $API_KEY" -H 'Content-Type: application/json' \
-    -d "$payload"
-}
-
-cmd_bench() {
-  need_bin jq
-  [[ -x "$LLAMA_SERVER_BIN" ]] || die "$LLAMA_SERVER_BIN not found. Run 'build' first."
-  if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-    die "A server is already running (PID $(cat "$PID_FILE")). bench needs exclusive control of the GPU/port to swap models safely — run 'stop' first, then rerun bench."
-  fi
-  [[ -f "$MODEL_DIR/$MODEL_FILE" ]] || die "$MODEL_DIR/$MODEL_FILE (the current baseline) not found. Run 'download' first."
-  [[ -f "bench/prompts/short.txt" ]] || die "bench/prompts/short.txt not found — run bench from the repo root."
-
-  local requested="${1:-$BENCH_QUANTS}"
-  local -a requested_labels allowed_labels
-  IFS=',' read -ra requested_labels <<< "$requested"
-  IFS=',' read -ra allowed_labels <<< "$BENCH_ALLOWED_QUANTS"
-
-  local label ok a
-  for label in "${requested_labels[@]}"; do
-    ok=0
-    for a in "${allowed_labels[@]}"; do [[ "$label" == "$a" ]] && ok=1 && break; done
-    [[ "$ok" -eq 1 ]] || die "Quant '$label' is not in BENCH_ALLOWED_QUANTS ($BENCH_ALLOWED_QUANTS). Q4_K_M and below are deliberately excluded: a community report on similar hardware (same MTP speculative-decoding approach) found more aggressive quantization caused 'draft-acceptance collapse' — net SLOWER, not faster, because the draft head disagrees with a noisier main model more often. Not independently reproduced on this box, but treated as a real constraint, not a guess to test past. See README."
-  done
-
-  # Baseline is whatever's actually configured right now — so a future
-  # rerun after adopting a candidate automatically benchmarks the new
-  # production quant against further candidates, not a hardcoded "Q8_0".
-  local -a entry_labels=("${MODEL_FILE} (current)") entry_files=("$MODEL_FILE")
-  local file
-  for label in "${requested_labels[@]}"; do
-    file="$(_bench_quant_file "$label")"
-    [[ "$file" == "$MODEL_FILE" ]] && continue  # already the baseline, don't test twice
-    entry_labels+=("$label")
-    entry_files+=("$file")
-  done
-
-  mkdir -p "$LOG_DIR/bench"
-  local ts results_file
-  ts="$(date -u +%Y%m%dT%H%M%SZ)"
-  results_file="$LOG_DIR/bench/bench-${ts}.jsonl"
-
-  # Guarantee production is left running regardless of how bench exits
-  # (clean finish, error, or Ctrl-C mid-run) — stop whatever bench spawned,
-  # restore MODEL_FILE, restart on the original config. Deliberately NOT
-  # `local`: the EXIT trap fires after cmd_bench itself has already
-  # returned (it's a script-exit trap, not a function-exit trap), so a
-  # `local` here goes out of scope before the trap runs — confirmed by
-  # hand (an early version hit "cleanup_done: unbound variable" at exactly
-  # this point). Must be a real global to still be readable when the trap
-  # fires.
-  BENCH_ORIG_MODEL_FILE="$MODEL_FILE"
-  BENCH_CLEANUP_DONE=0
-  _bench_cleanup() {
-    [[ "$BENCH_CLEANUP_DONE" -eq 1 ]] && return
-    BENCH_CLEANUP_DONE=1
-    cmd_stop
-    MODEL_FILE="$BENCH_ORIG_MODEL_FILE"
-    log "bench: restoring production server ($BENCH_ORIG_MODEL_FILE)..."
-    cmd_serve
-  }
-  trap _bench_cleanup EXIT INT TERM
-
-  log "bench: ${#entry_labels[@]} entries, ${BENCH_REPEATS} reps x 2 prompts each — this will take a while (30-90+ minutes at this hardware's throughput). Results: $results_file"
-
-  local i
-  for i in "${!entry_labels[@]}"; do
-    label="${entry_labels[$i]}"; file="${entry_files[$i]}"
-    if [[ ! -f "$MODEL_DIR/$file" ]]; then
-      _download_gguf "$MODEL_REPO" "$file" "$(_bench_quant_expect_bytes "$label")"
-    fi
-
-    MODEL_FILE="$file"
-    _build_server_args "$MODEL_FILE"
-    log "bench: [$label] starting llama-server..."
-    setsid "$LLAMA_SERVER_BIN" "${SERVER_ARGS[@]}" >> "$STDOUT_LOG" 2>&1 < /dev/null &
-    local pid=$!
-    echo "$pid" > "$PID_FILE"
-    _wait_healthy "$pid"
-
-    _bench_request "Say OK." >/dev/null 2>&1 || true  # discarded warm-up
-
-    local prompt_label prompt_content rep resp finish_reason prompt_n prompt_ms predicted_n predicted_ms draft_n draft_n_accepted
-    for prompt_label in short long; do
-      prompt_content="$([[ "$prompt_label" == short ]] && cat bench/prompts/short.txt || _bench_long_prompt)"
-      for rep in $(seq 1 "$BENCH_REPEATS"); do
-        resp="$(_bench_request "$prompt_content")" || { warn "bench: [$label] $prompt_label rep $rep: request failed, skipping."; continue; }
-        finish_reason="$(jq -r '.choices[0].finish_reason // "error"' <<<"$resp")"
-        prompt_n="$(jq -r '.timings.prompt_n // 0' <<<"$resp")"
-        prompt_ms="$(jq -r '.timings.prompt_ms // 0' <<<"$resp")"
-        predicted_n="$(jq -r '.timings.predicted_n // 0' <<<"$resp")"
-        predicted_ms="$(jq -r '.timings.predicted_ms // 0' <<<"$resp")"
-        draft_n="$(jq -r '.timings.draft_n // 0' <<<"$resp")"
-        draft_n_accepted="$(jq -r '.timings.draft_n_accepted // 0' <<<"$resp")"
-        jq -nc --arg type request --arg label "$label" --arg file "$file" --arg prompt "$prompt_label" --argjson rep "$rep" \
-          --argjson prompt_n "$prompt_n" --argjson prompt_ms "$prompt_ms" --argjson predicted_n "$predicted_n" --argjson predicted_ms "$predicted_ms" \
-          --argjson draft_n "$draft_n" --argjson draft_n_accepted "$draft_n_accepted" --arg finish_reason "$finish_reason" \
-          '{type:$type,label:$label,file:$file,prompt:$prompt,rep:$rep,prompt_n:$prompt_n,prompt_ms:$prompt_ms,predicted_n:$predicted_n,predicted_ms:$predicted_ms,draft_n:$draft_n,draft_n_accepted:$draft_n_accepted,finish_reason:$finish_reason}' \
-          >> "$results_file"
-        local gen_tps=0; [[ "$predicted_ms" != "0" ]] && gen_tps="$(jq -n --argjson n "$predicted_n" --argjson ms "$predicted_ms" '($n / ($ms/1000)) | round')"
-        log "bench: [$label] $prompt_label rep $rep/$BENCH_REPEATS: gen ${gen_tps} tok/s, finish=${finish_reason}"
-      done
-    done
-
-    cmd_stop
-  done
-
-  echo "=== bench results: $results_file ==="
-  jq -s '
-    map(select(.type=="request"))
-    | group_by(.label + "|" + .prompt)
-    | map({
-        label: .[0].label, prompt: .[0].prompt, n: length,
-        gen_tps_median: (map(if .predicted_ms>0 then (.predicted_n/(.predicted_ms/1000)) else 0 end) | sort | .[(length-1)/2|floor]),
-        prompt_tps_median: (map(if .prompt_ms>0 then (.prompt_n/(.prompt_ms/1000)) else 0 end) | sort | .[(length-1)/2|floor]),
-        accept_pct_median: ([.[] | select(.draft_n>0) | (100*.draft_n_accepted/.draft_n)] | if length>0 then (sort | .[(length-1)/2|floor]) else null end),
-        stop_pct: (100 * (map(.finish_reason=="stop") | map(if . then 1 else 0 end) | add) / length),
-        no_empty: (map(.predicted_n>0) | all)
-      })
-  ' "$results_file" | tee "$LOG_DIR/bench/bench-${ts}-summary.json"
-
-  echo
-  echo "Decision rule: candidate must beat baseline long-context gen tok/s by >= ${BENCH_MIN_SPEEDUP_PCT}%, and not drop draft-accept% by more than ${BENCH_MAX_ACCEPTANCE_DROP_PP} points vs baseline, with all responses finishing cleanly."
-  # NOTE: finish_reason=="stop" is reported but NOT a pass/fail gate.
-  # Confirmed by hand: this model reasons at length before answering (a
-  # real production turn ran 12,000+ tokens without reaching a natural
-  # stop — see the QWEN_CODE_MAX_OUTPUT_TOKENS fix/README), so at a fixed
-  # BENCH_GEN_TOKENS budget, healthy responses routinely hit `length`
-  # before finishing a thought — that's a budget artifact, not a quant
-  # defect. Gating on all_stop would fail every candidate regardless of
-  # quality. The real correctness signal is no_empty (every response
-  # actually produced output) — a truly broken/garbled load tends to
-  # error or return nothing, not merely truncate.
-  local baseline_label="${entry_labels[0]}"
-  jq -s --arg baseline "$baseline_label" --argjson min_speedup "$BENCH_MIN_SPEEDUP_PCT" --argjson max_drop "$BENCH_MAX_ACCEPTANCE_DROP_PP" '
-    map(select(.type=="request"))
-    | group_by(.label + "|" + .prompt)
-    | map({
-        label: .[0].label, prompt: .[0].prompt,
-        gen_tps_median: (map(if .predicted_ms>0 then (.predicted_n/(.predicted_ms/1000)) else 0 end) | sort | .[(length-1)/2|floor]),
-        accept_pct_median: ([.[] | select(.draft_n>0) | (100*.draft_n_accepted/.draft_n)] | if length>0 then (sort | .[(length-1)/2|floor]) else null end),
-        stop_pct: (100 * (map(.finish_reason=="stop") | map(if . then 1 else 0 end) | add) / length),
-        no_empty: (map(.predicted_n>0) | all)
-      })
-    | (map(select(.label==$baseline and .prompt=="long")) | .[0]) as $base
-    | map(select(.label!=$baseline and .prompt=="long"))
-    | map(. + {
-        speedup_pct: (if $base.gen_tps_median>0 then (100*(.gen_tps_median-$base.gen_tps_median)/$base.gen_tps_median) else null end),
-        accept_drop_pp: (if (.accept_pct_median!=null and $base.accept_pct_median!=null) then ($base.accept_pct_median - .accept_pct_median) else null end)
-      })
-    | map(. + { pass: (.no_empty and (.speedup_pct!=null and .speedup_pct>=$min_speedup) and ((.accept_drop_pp==null) or (.accept_drop_pp<=$max_drop))) })
-  ' "$results_file"
-
-  log "bench complete. Adoption is manual — see README 'Adopting a bench result'. Restoring production server now."
-}
-
 cmd_selftest() {
   local url="http://127.0.0.1:${PORT}"
   local resp
@@ -792,9 +552,9 @@ cmd_install_watchdog() {
   local unit_dir="$HOME/.config/systemd/user"
   local script_path; script_path="$(readlink -f "${BASH_SOURCE[0]}")"
 
-  cat > "$unit_dir/qwen38-watchdog.service" <<EOF
+  cat > "$unit_dir/laguna-watchdog.service" <<EOF
 [Unit]
-Description=Qwen3.8 selftest-gated watchdog (restarts only on failed selftest)
+Description=Laguna S 2.1 selftest-gated watchdog (restarts only on failed selftest)
 
 [Service]
 Type=oneshot
@@ -802,9 +562,9 @@ WorkingDirectory=${SCRIPT_DIR}
 ExecStart=/bin/bash -c '${script_path} selftest || ${script_path} restart'
 EOF
 
-  cat > "$unit_dir/qwen38-watchdog.timer" <<EOF
+  cat > "$unit_dir/laguna-watchdog.timer" <<EOF
 [Unit]
-Description=Run qwen38-watchdog every ${interval_hours}h
+Description=Run laguna-watchdog every ${interval_hours}h
 
 [Timer]
 OnBootSec=15min
@@ -816,14 +576,14 @@ WantedBy=timers.target
 EOF
 
   systemctl --user daemon-reload
-  systemctl --user enable --now qwen38-watchdog.timer
+  systemctl --user enable --now laguna-watchdog.timer
   log "Watchdog installed: selftest every ${interval_hours}h, restarts server only if selftest fails."
   log "This does NOT blindly restart on a timer — see README for why."
 }
 
 cmd_uninstall_watchdog() {
-  systemctl --user disable --now qwen38-watchdog.timer 2>/dev/null || true
-  rm -f "$HOME/.config/systemd/user/qwen38-watchdog.service" "$HOME/.config/systemd/user/qwen38-watchdog.timer"
+  systemctl --user disable --now laguna-watchdog.timer 2>/dev/null || true
+  rm -f "$HOME/.config/systemd/user/laguna-watchdog.service" "$HOME/.config/systemd/user/laguna-watchdog.timer"
   systemctl --user daemon-reload
   log "Watchdog uninstalled."
 }
@@ -861,9 +621,14 @@ EOF
   # on this box, pointed at a pre-existing Ollama deployment on :11434).
   # Patch settings.json's default provider in place, non-destructively:
   # add/update our provider entry by id, keep any others (e.g. Ollama)
-  # untouched in the list, just stop selecting them by default.
-  local provider_id="qwen38-gfx1151"
-  local env_key="QWEN38_GFX1151_API_KEY"
+  # untouched, just stop selecting them by default. Also strips out the
+  # old "qwen38-gfx1151" id this repo used before it was renamed away from
+  # its original Qwen3.8-27B deployment, so re-running this after an
+  # upgrade cleans up that legacy entry automatically instead of leaving
+  # an orphaned duplicate.
+  local provider_id="laguna-gfx1151"
+  local legacy_provider_id="qwen38-gfx1151"
+  local env_key="LAGUNA_GFX1151_API_KEY"
   local existing="{}"
   if [[ -f "$settings_path" ]]; then
     cp "$settings_path" "${settings_path}.bak.$(date +%s)"
@@ -880,21 +645,21 @@ EOF
   # CTX_SIZE itself — see the CLIENT_CTX_SIZE comment in load_env for why:
   # qwen-code's token counts are estimates, and reporting the exact real
   # limit still overshot into a hard 400 in practice. Without this field at
-  # all, qwen-code defaults to assuming ~1,000,000 tokens (Qwen3.8's
-  # advertised native/YaRN context) and paces its own auto-compaction
-  # against that instead of what this server can actually serve. This
-  # field is documented in qwen-code's own model-providers.md and is an
-  # "impermeable layer" that fully replaces generationConfig for this
-  # provider entry (per-field settings-level values are NOT inherited).
-  # Timeouts are raised generously given this hardware's measured
-  # multi-minute turn latency (see README "Expected performance").
+  # all, qwen-code defaults to assuming ~1,000,000 tokens and paces its own
+  # auto-compaction against that instead of what this server can actually
+  # serve. This field is documented in qwen-code's own model-providers.md
+  # and is an "impermeable layer" that fully replaces generationConfig for
+  # this provider entry (per-field settings-level values are NOT
+  # inherited). Timeouts are raised generously given this hardware's
+  # measured multi-minute turn latency (see README "Expected performance").
   local updated
   updated="$(jq \
     --arg base_url "$base_url" \
     --arg env_key "$env_key" \
     --arg api_key "$API_KEY" \
     --arg provider_id "$provider_id" \
-    --arg provider_name "Qwen3.8-27B (gfx1151 llama.cpp/HIP)" \
+    --arg legacy_provider_id "$legacy_provider_id" \
+    --arg provider_name "Laguna S 2.1 (gfx1151 llama.cpp/HIP)" \
     --arg model_name "$SERVED_MODEL_NAME" \
     --argjson ctx_size "$CLIENT_CTX_SIZE" \
     --argjson tool_output_threshold "$QWEN_TOOL_OUTPUT_THRESHOLD" \
@@ -903,7 +668,7 @@ EOF
     --argjson max_output_tokens "$QWEN_CODE_MAX_OUTPUT_TOKENS" \
     '
     .env[$env_key] = $api_key
-    | .modelProviders.openai = ((.modelProviders.openai // []) | map(select(.id != $provider_id)) + [{
+    | .modelProviders.openai = ((.modelProviders.openai // []) | map(select(.id != $provider_id and .id != $legacy_provider_id)) + [{
         baseUrl: $base_url, envKey: $env_key, id: $provider_id, name: $provider_name,
         generationConfig: {
           contextWindowSize: $ctx_size,
@@ -933,13 +698,13 @@ EOF
 
 usage() {
   cat <<'EOF'
-Usage: ./serve-qwen38.sh <command>
+Usage: ./serve-laguna.sh <command>
 
   init               Create dirs, generate/reuse API key
   probe              Preflight: GPU, ROCm, GTT tuning, disk/RAM, known-bug summary
   build              Clone/update llama.cpp to latest master and build for gfx1151
   update             Alias for build
-  download           Fetch GGUF weights + mmproj (needs ~35GB free)
+  download           Fetch GGUF weights (needs ~35GB free)
   check              Bounded smoke-load test (no long-running server)
   serve              Launch llama-server in the background, wait for /health
   status             Show whether it's running, health, recent log lines
@@ -949,9 +714,6 @@ Usage: ./serve-qwen38.sh <command>
   install-watchdog [hours]   Install a systemd --user timer: selftest, restart only on failure (default 2h)
   uninstall-watchdog         Remove the watchdog timer
   wire-qwen-code     Write ~/.qwen/.env (or project .qwen/.env) pointing at this server
-  bench [quants]     Benchmark alternate GGUF quants (default: $BENCH_QUANTS) against
-                      the current MODEL_FILE, using production's exact server flags.
-                      Always restores the original server on exit. See README.
 EOF
 }
 
@@ -972,7 +734,6 @@ main() {
     install-watchdog) shift; cmd_install_watchdog "${1:-2}" ;;
     uninstall-watchdog) cmd_uninstall_watchdog ;;
     wire-qwen-code) cmd_wire_qwen_code ;;
-    bench) shift; cmd_bench "${1:-}" ;;
     *) usage; exit 1 ;;
   esac
 }

@@ -1,4 +1,4 @@
-qwen38.env
+laguna.env
 vendor/
 models/
 .secrets/

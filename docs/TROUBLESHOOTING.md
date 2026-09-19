@@ -14,32 +14,30 @@ start unless `LD_LIBRARY_PATH` (or an `ld.so.conf.d` entry + `ldconfig`) is
 set explicitly. If you build other ROCm software outside this repo on this
 box, you'll hit the same thing.
 
-## Garbled / wrong output on longer prompts
+## Garbled / wrong output on a very long single prompt
 
-Check `UBATCH_SIZE` in `qwen38.env`. This is
-[llama.cpp#28211](https://github.com/ggml-org/llama.cpp/issues/28211):
-on HIP/gfx1151, prompts longer than `n_ubatch` get silently wrong logits
-(no crash, no error — just bad output). The default here (8192) covers most
-real prompts but is not a fix; if you're pushing very long single prompts,
-raise `UBATCH_SIZE`/`BATCH_SIZE` further and re-test, or chunk the prompt.
-
-## Throughput falls off a cliff on long conversations
-
-[llama.cpp#27623](https://github.com/ggml-org/llama.cpp/issues/27623):
-decode throughput collapses ~25x once KV position exceeds ~80K tokens on
-this hybrid Gated-DeltaNet architecture. Lower `CTX_SIZE`, or start a fresh
-conversation before hitting that range. `serve` warns if `CTX_SIZE` is set
-above 81920.
+Check `UBATCH_SIZE` in `laguna.env` (default 2048). This is the class of
+bug described in
+[llama.cpp#28211](https://github.com/ggml-org/llama.cpp/issues/28211): on
+HIP/gfx1151, prompts longer than `n_ubatch` have been reported to get
+silently wrong logits (no crash, no error — just bad output) on some
+model/config combinations. Verified NOT reproduced on this exact
+model/build at `UBATCH_SIZE=2048` up to 4088 tokens tested
+(needle-in-haystack, exact marker retrieval) — nothing past that has been
+directly verified. If you're pushing a much longer single prompt, raise
+`UBATCH_SIZE`/`BATCH_SIZE` and re-test the same way (a unique marker
+string buried in a long prompt, check it comes back exactly) rather than
+assuming a larger value is automatically safe, or unsafe.
 
 ## Output quality degrades over a long session, a fresh restart fixes it
 
 [lemonade-sdk#3160](https://github.com/lemonade-sdk/lemonade/issues/3160):
 progressive generation corruption under sustained/concurrent load on
-ROCm-nightly gfx1151. Run `./serve-qwen38.sh restart`. If you routinely hit
+ROCm-nightly gfx1151. Run `./serve-laguna.sh restart`. If you routinely hit
 this, install the selftest-gated watchdog:
 
 ```bash
-./serve-qwen38.sh install-watchdog 2   # selftest every 2h, restarts only on failure
+./serve-laguna.sh install-watchdog 2   # selftest every 2h, restarts only on failure
 ```
 
 This deliberately does **not** restart blindly on a timer — a
@@ -51,8 +49,8 @@ diagnostic signal worth reporting upstream if it fires often.
 `build`'s verification step checks that `llama-server --help` exposes
 `--ubatch-size`, `--parallel`, `--jinja`, `--mmproj`, `--api-key`,
 `--ctx-size`. If one is missing, your checkout is likely too old or a flag
-was renamed upstream. Rerun `./serve-qwen38.sh update` to pull latest
-master. bartowski's GGUF explicitly requires llama.cpp build b10896+.
+was renamed upstream. Rerun `./serve-laguna.sh update` to pull latest
+master.
 
 ## `apt update` finds no ROCm package for this Ubuntu release
 
@@ -61,14 +59,15 @@ publish a `resolute` component yet. Use the `noble` component instead (see
 README "System prep") — ROCm's userspace isn't kernel-ABI-tied the way the
 driver is. If a needed fix is only in ROCm nightly, use a
 [TheRock](https://github.com/ROCm/TheRock) nightly tarball and set
-`ROCM_PATH` in `qwen38.env`.
+`ROCM_PATH` in `laguna.env`.
 
 ## Server hangs on model load
 
 Confirm `-dio` made it into the assembled `llama-server` argv (visible in
-`logs/qwen38.stdout.log` at startup, or check `serve`'s flag-detection
+`logs/laguna.stdout.log` at startup, or check `serve`'s flag-detection
 logic against `llama-server --help`). Direct I/O is reported necessary for
-models this large (~29GB) to avoid a load hang on some configurations.
+models this large (~73GB across 3 shards) to avoid a load hang on some
+configurations.
 
 ## `probe` warns that `amdgpu.gttsize` isn't set
 
@@ -79,26 +78,68 @@ fail unexpectedly.
 
 ## `[API Error: 400 request (N tokens) exceeds the available context size (CTX_SIZE tokens)]`
 
-**Note (2026-09-18): the "stay under ~80K" assumption in step 1 below was retested and didn't hold** — see README "The 80K cliff was retested and didn't reproduce." `CTX_SIZE` is now 131072 (up from 73728), with `CLIENT_CTX_SIZE`/`QWEN_SESSION_TOKEN_LIMIT` scaled up proportionally. The rest of this entry (steps 2-6) is unaffected — those are `qwen-code` client-side issues, not about where the server's ceiling should sit — and is kept here as the accurate history of how the current defaults were arrived at.
+This is a `qwen-code` client-side behavior, not specific to which model is
+behind the server — worth understanding in full if you hit it:
 
-Five layers to this, in the order they were actually discovered — each one fixed a real gap in the one before it:
+1. **Naive fix (insufficient on its own)**: raise `CTX_SIZE` in
+   `laguna.env` and `./serve-laguna.sh restart`.
+2. **`qwen-code` needs to know the ceiling**: it doesn't know this server's
+   real `CTX_SIZE` unless its provider entry in `settings.json` sets
+   `generationConfig.contextWindowSize`. Without it, `qwen-code` assumes
+   the model's advertised native context (Laguna's is 1,048,576) and won't
+   proactively compact — it just keeps growing until the server
+   hard-rejects the request.
+3. **Telling it the *exact* ceiling still isn't enough**: `qwen-code`'s own
+   token counts are estimates (`estimated=true` in its debug log), and a
+   single large step (one big tool result, a large file read) can jump
+   past its compaction trigger before compaction gets a chance to run.
+   Confirmed directly on this repo's deployment history: reporting the
+   exact real ceiling still overshot and hard-failed anyway.
+4. **A margin between `CLIENT_CTX_SIZE` and `CTX_SIZE` helps but isn't
+   sufficient on its own either**: confirmed directly — a 16,384-token
+   margin was completely blown through in one turn. `qwen-code`'s
+   proactive compaction does not reliably trigger before a large enough
+   single addition.
+5. **Cap how much a single turn can add, don't just hope compaction
+   catches it in time.** `qwen-code`'s per-tool-call
+   `tools.truncateToolOutputThreshold` (stock default 25,000 characters)
+   still lets a *batch* of several fanned-out tool calls (e.g. reading
+   many files at once) add up to far more than that in one turn.
+   `wire-qwen-code` sets `tools.truncateToolOutputThreshold=8000` and
+   `tools.truncateToolOutputLines=300` to bound this. These are global
+   `settings.json` fields, not provider-specific, and **require a fresh
+   `qwen` session to take effect** (not just Ctrl+Y retry).
+6. **`model.sessionTokenLimit` ordering matters — it must sit *above*
+   `CLIENT_CTX_SIZE`, not below it.** Confirmed directly by getting this
+   wrong first: a value below `CLIENT_CTX_SIZE` meant the hard block fired
+   *before* `qwen-code`'s own proactive compaction ever got a chance to
+   run — every session just hit a wall (`Session token limit exceeded`)
+   requiring manual `/compress` or `/clear`, instead of compacting quietly
+   in the background as intended. The default here (114,688) sits between
+   `CLIENT_CTX_SIZE` (98,304, soft trigger) and `CTX_SIZE` (131,072, real
+   hard limit), so it functions as the true last-resort backstop it was
+   meant to be.
 
-1. **Naive fix (insufficient on its own)**: raise `CTX_SIZE` in `qwen38.env` and `./serve-qwen38.sh restart`. Recurred three times as this alone (32768 → 65536 → 73728) before the client-side fixes below (steps 2-6) addressed the real cause.
-2. **`qwen-code` needs to know the ceiling**: it doesn't know this server's real `CTX_SIZE` unless its provider entry in `settings.json` sets `generationConfig.contextWindowSize`. Without it, `qwen-code` assumes the model's advertised ~1,000,000-token context and won't proactively compact — it just keeps growing until the server hard-rejects the request.
-3. **Telling it the *exact* ceiling still isn't enough**: confirmed directly — reporting `contextWindowSize` equal to the real `CTX_SIZE` (65536) still overshot to 68046 tokens and hard-failed anyway. `qwen-code`'s own token counts are estimates (`estimated=true` in its debug log), and a single large step (one big tool result, a large file read) can jump past its compaction trigger before compaction gets a chance to run.
-4. **A margin between `CLIENT_CTX_SIZE` and `CTX_SIZE` helps but isn't sufficient either**: confirmed directly — a 16,384-token margin (57344 reported vs. 73728 real) was still completely blown through in one turn (74602 tokens, 874 over the real hard limit). `qwen-code`'s proactive compaction does not reliably trigger before a large enough single addition.
-5. **Cap how much a single turn can add, don't just hope compaction catches it in time.** `qwen-code`'s per-tool-call `tools.truncateToolOutputThreshold` (stock default 25,000 characters) still lets a *batch* of several fanned-out tool calls (e.g. reading many files at once) add up to far more than that in one turn. `wire-qwen-code` sets `tools.truncateToolOutputThreshold=8000` and `tools.truncateToolOutputLines=300` to bound this. These are global `settings.json` fields, not provider-specific, and **require a fresh `qwen` session to take effect** (not just Ctrl+Y retry).
-6. **`model.sessionTokenLimit` ordering matters — it must sit *above* `CLIENT_CTX_SIZE`, not below it.** Confirmed directly by getting this wrong first: an initial value of 50000 (below `CLIENT_CTX_SIZE=57344`) meant the hard block fired *before* `qwen-code`'s own proactive compaction ever got a chance to run — every session just hit a wall (`Session token limit exceeded`) requiring manual `/compress` or `/clear`, instead of compacting quietly in the background as intended. Fixed by raising it to 65536 — between `CLIENT_CTX_SIZE` (57344, where soft auto-compaction should trigger) and `CTX_SIZE` (73728, the real server hard limit) — so it now functions as the true last-resort backstop it was meant to be, not the first thing that fires.
+If you see `Session token limit exceeded: N tokens > LIMIT limit` from
+`qwen-code` itself (not a server 400), that's this backstop working as
+designed, not a new bug — run `/compress` (preserves the session) or
+`/clear` (starts fresh) as it suggests.
 
-If you see `Session token limit exceeded: N tokens > LIMIT limit` from `qwen-code` itself (not a server 400), that's this backstop working as designed, not a new bug — run `/compress` (preserves the session) or `/clear` (starts fresh) as it suggests.
+Why not just enable llama-server's `--context-shift` ("infinite"
+generation by discarding old context instead of hard-failing)? Its discard
+mechanism needs to partially truncate the KV cache. That's fine for
+Laguna's conventional attention, but this repo treats it as a
+per-architecture risk to re-evaluate rather than a default to lean on —
+some hybrid/recurrent architectures can't have their memory partially
+truncated safely at all, and the client-side layered defenses above work
+regardless of architecture, so there's no need to depend on that
+assumption either way.
 
-Why **not** just enable llama-server's `--context-shift`, which is designed for exactly this ("infinite" generation by discarding old context instead of hard-failing)? Deliberately rejected: its discard mechanism relies on partially truncating the KV cache, but this model's Gated-DeltaNet recurrent-state layers can't be partially truncated the way normal attention KV cache can — `llama_memory_seq_rm()` fails on a partial range for hybrid/recurrent models, and real-world reports describe resulting position-accounting desync, not just reduced performance. The risk is silent corruption, not a clean fallback. Server-side auto-truncation is not a safe option for this architecture; the fix has to live on the client side, capping what gets added in the first place.
-
-If it recurs even with all of the above, that's a strong signal the session's genuine, non-tool-output conversation content (the back-and-forth text itself) has grown past a comfortable working set — starting a fresh `qwen` session is the sustainable move. Raising `CTX_SIZE` further is now less risky than the README's older "~80K cliff" framing suggested (retested and not reproduced up to ~97K as of 2026-09-18), but still treat anything past what's actually been verified as untested, not safe-by-default.
-
-`./serve-qwen38.sh wire-qwen-code` writes all of this automatically; rerun it after changing any of `CTX_SIZE`, `CLIENT_CTX_SIZE`, `QWEN_TOOL_OUTPUT_THRESHOLD`, `QWEN_TOOL_OUTPUT_LINES`, or `QWEN_SESSION_TOKEN_LIMIT`, and on every other machine (laptops included) that points `qwen-code` at this server.
-
-If it recurs even with this margin in place, that's a signal the session's genuine history has grown past a comfortable working set for this hardware — starting a fresh `qwen` session is more sustainable than continuing to raise the ceiling toward the decode-collapse threshold.
+`./serve-laguna.sh wire-qwen-code` writes all of this automatically;
+rerun it after changing any of `CTX_SIZE`, `CLIENT_CTX_SIZE`,
+`QWEN_TOOL_OUTPUT_THRESHOLD`, `QWEN_TOOL_OUTPUT_LINES`, or
+`QWEN_SESSION_TOKEN_LIMIT`, and on every other machine (laptops included)
+that points `qwen-code` at this server.
 
 ## `[API Error: Stream exceeded its 900000ms upstream-wait cap after N chunks without completing...]`
 
@@ -108,16 +149,16 @@ error — it kills the connection and **discards the entire in-flight
 response** if a single streamed reply runs longer than that, regardless of
 whether generation is healthy.
 
-First check the server side wasn't actually stuck: `tail logs/qwen38.log`
+First check the server side wasn't actually stuck: `tail logs/laguna.log`
 for that time window — a healthy generation shows steady `n_gen`/`tg`
 climbing at a consistent tok/s (confirmed directly: one real incident
-generated 12,000+ tokens at a stable ~13.5 tok/s with no stall, so the
-throughput alone doesn't tell you whether the *content* was useful progress
-or a repetitive/stuck ramble — you'd need to check what `qwen-code` actually
+generated 12,000+ tokens at a stable pace with no stall, so the throughput
+alone doesn't tell you whether the *content* was useful progress or a
+repetitive/stuck ramble — you'd need to check what `qwen-code` actually
 displayed).
 
-`wire-qwen-code` now sets `QWEN_CODE_MAX_OUTPUT_TOKENS` (default 10,000,
-via `generationConfig.samplingParams.max_tokens`) specifically to prevent
+`wire-qwen-code` sets `QWEN_CODE_MAX_OUTPUT_TOKENS` (default 10,000, via
+`generationConfig.samplingParams.max_tokens`) specifically to prevent
 this — without it, `qwen-code` defaults to the model's declared output
 limit (effectively unbounded here), so a long turn has nothing stopping it
 short of this 15-minute wall. If you still hit this after `wire-qwen-code`,
@@ -132,12 +173,11 @@ generation, it just lets it run longer before losing the response anyway.
 Likely not a hang. `qwen-code`'s full agentic mode sends a large system/
 tool-definition prompt (measured 8,000-20,000+ tokens on this setup) and
 can make several sequential LLM round-trips per turn (tool calls,
-reasoning), each only partially served from cache. At ~7-12 tok/s
-generation, a single interactive request can genuinely take several
-minutes. Confirm it's actually working via `./serve-qwen38.sh status` or
-`tail -f logs/qwen38.log` — you should see `prompt processing` and `n_gen`
-lines advancing. Use `qwen --bare` for a lighter/faster session if you
-don't need the full tool/skill registry.
+reasoning), each only partially served from cache. A single interactive
+request can genuinely take a while. Confirm it's actually working via
+`./serve-laguna.sh status` or `tail -f logs/laguna.log` — you should see
+`prompt processing` and `n_gen` lines advancing. Use `qwen --bare` for a
+lighter/faster session if you don't need the full tool/skill registry.
 
 ## `wire-qwen-code` ran but `qwen` still talks to a different server
 
@@ -145,76 +185,87 @@ Check `~/.qwen/settings.json` — its `security.auth.baseUrl` takes
 precedence over the `.env` file. `wire-qwen-code` patches both, but if
 you've manually edited `settings.json` since, or have multiple provider
 entries, confirm `security.auth` points at `http://127.0.0.1:$PORT/v1`.
-This box had a separate, pre-existing Ollama-based Qwen3.8 deployment
-(port 11434) already wired in when this repo was first set up —
-`wire-qwen-code` preserves that entry in `modelProviders.openai` (so you
-can switch back by hand) but changes which one is default.
+This box has a separate, pre-existing Ollama deployment (port 11434,
+unrelated to this repo) that was already wired into `settings.json` when
+this repo was first set up — `wire-qwen-code` preserves that entry in
+`modelProviders.openai` (so you can switch back by hand) but changes which
+one is default.
 
 ## `wire-qwen-code` ran, no errors, but a config value (e.g. `sessionTokenLimit`) is still old
 
 Two things to check, in order:
 
-1. **Is `qwen38.env` actually current?** `wire-qwen-code` only writes
-   what's in `qwen38.env` — if a value was never explicitly set there, it
-   falls back to a default hardcoded inside `serve-qwen38.sh` itself.
-   Confirmed by hand (2026-09-18): those internal fallback defaults had
-   gone stale after a `CTX_SIZE` bump — `qwen38.env` files were updated,
-   but the script's own `${VAR:-default}` fallbacks weren't, so any
-   machine whose `qwen38.env` predated a given var (or never had it
-   explicitly set) silently kept the *old* number instead of the current
-   one. `wire-qwen-code`'s own ordering-validation warnings are a useful
-   tell here — if you see e.g. `QWEN_SESSION_TOKEN_LIMIT (65536) is not
-   lower than CTX_SIZE (65536)`, both sides of that comparison resolving
-   to the same stale number is a sign at least one of them is falling back
-   to an old default rather than reading a real value. Fix: `grep -E
+1. **Is `laguna.env` actually current?** `wire-qwen-code` only writes
+   what's in `laguna.env` — if a value was never explicitly set there, it
+   falls back to a default hardcoded inside `serve-laguna.sh` itself.
+   Confirmed by hand on this repo's history: those internal fallback
+   defaults can go stale after a config bump if `laguna.env` isn't
+   updated to match — any machine whose `laguna.env` predates a given var
+   (or never had it explicitly set) silently keeps the *old* number
+   instead of the current one. `wire-qwen-code`'s own ordering-validation
+   warnings are a useful tell here — if you see e.g.
+   `QWEN_SESSION_TOKEN_LIMIT (65536) is not lower than CTX_SIZE (65536)`,
+   both sides of that comparison resolving to the same stale number is a
+   sign at least one of them is falling back to an old default rather
+   than reading a real value. Fix: `grep -E
    "^CTX_SIZE=|^CLIENT_CTX_SIZE=|^QWEN_SESSION_TOKEN_LIMIT="
-   qwen38.env` and compare against current `qwen38-env.example` — add or
+   laguna.env` and compare against current `laguna-env.example` — add or
    correct any missing/stale lines.
 2. **A fresh `qwen` session, not a retry** — `settings.json` is only read
    at process startup (see the stream-lifetime-cap entry above for the
    full explanation of this same gotcha in a different context).
 
-**On macOS**: if you hand-write a `sed -i '...'` fix (like the ones
-suggested in this repo's chat history) and it silently doesn't take
-effect, check whether you used Linux/GNU `sed -i` syntax — macOS ships
-BSD `sed`, which requires a backup-suffix argument (`sed -i '' '...'` or
-`sed -i.bak '...'`) and otherwise errors out or behaves unexpectedly
-without one. `serve-qwen38.sh` itself doesn't use `sed` (it uses `jq` for
-all JSON/config manipulation, which is portable), but any one-off manual
-fix command using `sed -i` needs the macOS-compatible form.
+**On macOS**: if you hand-write a `sed -i '...'` fix and it silently
+doesn't take effect, check whether you used Linux/GNU `sed -i` syntax —
+macOS ships BSD `sed`, which requires a backup-suffix argument
+(`sed -i '' '...'` or `sed -i.bak '...'`) and otherwise errors out or
+behaves unexpectedly without one. `serve-laguna.sh` itself doesn't use
+`sed` (it uses `jq` for all JSON/config manipulation, which is portable),
+but any one-off manual fix command using `sed -i` needs the
+macOS-compatible form.
 
-## `bench` left the server down instead of restoring it
+## `connect ECONNREFUSED 127.0.0.1:8000` on a client-only machine (e.g. a laptop)
 
-Shouldn't happen — `cmd_bench` installs a `trap ... EXIT INT TERM` that
-stops whatever it spawned and restarts the original `MODEL_FILE`
-regardless of how it exits. If it does happen anyway (e.g. a future edit
-reintroduces the bug below, or the box lost power mid-run), just
-`./serve-qwen38.sh serve` manually — nothing bench does is destructive to
-your actual model files or config.
+The client's `qwen` process is pointed at `localhost` instead of this
+server's real LAN address — usually because `SERVER_HOST` was never set
+(or got lost) in that machine's local `laguna.env` before running
+`wire-qwen-code`. Confirmed as a real incident: the server was healthy the
+whole time, so this is easy to misdiagnose as a server-side outage.
 
-The specific bug already hit and fixed once: the cleanup state
-(`BENCH_CLEANUP_DONE`, `BENCH_ORIG_MODEL_FILE`) must be real global
-variables, not `local` to `cmd_bench`. `trap ... EXIT` fires at *script*
-exit, which happens after `cmd_bench` has already `return`ed — a `local`
-goes out of scope before that point, and the trap handler hits an "unbound
-variable" error under `set -u` instead of actually restoring anything.
-Confirmed by hand: an early version did exactly this and left the box
-down. If you're extending `cmd_bench`, keep any state the trap handler
-reads as a real global.
+**Root cause**: `laguna.env` is gitignored on every machine — `git pull`
+only updates the tracked `laguna-env.example` template, never a machine's
+own real `laguna.env`. If a client clone's `laguna.env` predates
+`SERVER_HOST` being set, or the file was regenerated fresh, `SERVER_HOST`
+silently defaults to `127.0.0.1`.
 
-## `SPEC_TYPE=""` in `qwen38.env` doesn't actually disable speculative decoding
+Fix, on the client machine:
 
-Fixed 2026-09-19, but worth knowing the mechanism if you're extending this
-script: bash's `${VAR:-default}` (colon-dash) treats an explicit empty
-string the *same* as unset, silently falling back to the default anyway.
-`serve-qwen38.sh`'s `load_env()` used exactly this pattern for `SPEC_TYPE`,
-so setting `SPEC_TYPE=""` for a model with no MTP-style draft head (like
-Laguna S 2.1) was silently being overridden back to `"draft-mtp"` — caught
-only because the server's own ordering-check printed a `Speculative:` line
-inconsistent with what `qwen38.env` actually said. Fixed with `${VAR=default}`
-(bare `=`, no colon), which only fills in the default when the variable is
-truly unset. If you add another var where "explicitly empty" needs to mean
-something different from "not set," use the same bare-`=` form, not `:-`.
+```bash
+jq -r '.modelProviders.openai[] | select(.id=="laguna-gfx1151") | .baseUrl' ~/.qwen/settings.json   # confirm the actual bug
+grep -n SERVER_HOST laguna.env                                                                       # confirm the cause
+echo 'SERVER_HOST="<server-lan-ip>"' >> laguna.env   # or edit the existing line
+./serve-laguna.sh wire-qwen-code
+```
+
+Then start a fresh `qwen` session. Also worth checking `curl
+http://<server-lan-ip>:8000/health` from the client to confirm basic
+network reachability if the above doesn't explain it.
+
+## `SPEC_TYPE=""` in `laguna.env` doesn't actually disable speculative decoding
+
+Historical, already fixed — worth knowing the mechanism if you're
+extending this script and add a variable where "explicitly empty" needs
+to mean something different from "not set": bash's `${VAR:-default}`
+(colon-dash) treats an explicit empty string the *same* as unset, silently
+falling back to the default anyway. An earlier version of `load_env()`
+used exactly this pattern for `SPEC_TYPE` with a non-empty fallback
+default, which meant an explicit `SPEC_TYPE=""` was being silently
+overridden back to that default — caught only because the server's own
+`Speculative:` startup banner line was inconsistent with what the env file
+actually said. If you ever give a variable here a non-empty default and
+need "explicitly empty" to stick, use `${VAR=default}` (bare `=`, no
+colon) instead, which only fills in the default when the variable is
+truly unset.
 
 ## Poolside's `llama.cpp` fork (branch `laguna`), DFlash speculative decoding hangs
 
@@ -228,18 +279,16 @@ the fork's own source (`src/llama-context.cpp`, `src/models/dflash.cpp`):
 `ctx_other` is how DFlash's draft model shares the target model's
 embedding/output-head weights, and the server isn't recovering from the
 expected-during-fitting exception the way the "this warning is normal"
-message implies it should. Not adopted — Laguna S 2.1 runs fine on
-**mainline** llama.cpp without speculative decoding (~26 tok/s, already
-faster than Qwen3.8-27B's best result), so this wasn't worth chasing
-further. If you want to retry: the target model itself works correctly on
-this same fork with plain decoding (only the `-md`/`--spec-type
-draft-dflash` combination is broken), so if the fork updates, it may be
-worth a quick retest — `git -C vendor/llama.cpp-poolside pull` then rerun
-the same command from the README's DFlash section.
+message implies it should. Not adopted — the model runs fine on
+**mainline** llama.cpp without speculative decoding (~26 tok/s, see
+README "Expected performance"), so this wasn't worth chasing further. If
+you want to retry: the target model itself works correctly on this same
+fork with plain decoding (only the `-md`/`--spec-type draft-dflash`
+combination is broken), so if the fork updates, it may be worth a quick
+retest — `git -C vendor/llama.cpp-poolside pull` then rerun the same
+command from this entry.
 
-## Adding a new model: things that bit us, checklist for next time
-
-From the Qwen3.8-27B → Laguna S 2.1 switch:
+## Adding a new model: things to check first
 
 - **Sharded GGUF models** (multiple `-0000N-of-0000M.gguf` files): set
   `MODEL_FILE` to the first shard, `MODEL_FILE_EXTRA_SHARDS` (comma-
@@ -250,31 +299,35 @@ From the Qwen3.8-27B → Laguna S 2.1 switch:
   webpage scrape, HF's tree UI is JS-rendered and unreliable to scrape.
 - **`UBATCH_SIZE`/`BATCH_SIZE` are not free to leave at a previous
   model's value.** Compute-buffer memory scales with ubatch size roughly
-  independent of context length — an 8192 value tuned for one model's
-  bug (llama.cpp#28211, Qwen-specific) cost ~4.3GB of GPU memory that a
-  different model might not need to spend at all. Test whether the new
-  model actually needs a large ubatch (a needle-in-haystack prompt
-  longer than the smaller candidate value, checking for exact retrieval)
-  before assuming the previous model's mitigation still applies.
+  independent of context length — a large value tuned for one model's
+  needs can cost several GB of GPU memory that a different model might
+  not need to spend at all. Test whether the new model actually needs a
+  large ubatch (a needle-in-haystack prompt longer than the smaller
+  candidate value, checking for exact retrieval) before assuming a
+  previous model's setting still applies.
 - **Check the model's own architecture file in your local llama.cpp
   checkout** (`vendor/llama.cpp/src/models/<name>.cpp`) before assuming
   GPU support is mature: does it use shared helpers like `build_attn`/
   `build_moe_ffn` (mature, backend-complete, low risk) or introduce a
-  novel custom op (high risk of exactly the kernel-immaturity problems
-  documented throughout this repo's history for Qwen3.8's Gated-DeltaNet)?
+  novel custom op (higher risk of immature-kernel performance problems)?
 - **A model's own `--jinja`/tool-calling/reasoning support isn't
-  guaranteed to need the same server flags** as the previous model, but
-  in practice `--jinja` has been required by every model tried here so
-  far (Qwen3.8-27B, Laguna S 2.1) — check the model card's own serving
-  instructions before assuming, but it's a safe first guess.
+  guaranteed**, but in practice every model tried on this box so far has
+  needed `--jinja` — check the model card's own serving instructions
+  before assuming, but it's a safe first guess.
 - **mmproj is optional** — `MMPROJ_FILE=""` for a non-multimodal model;
   `_build_server_args`/`cmd_download` already handle this correctly
   (conditional on the file existing / the variable being non-empty).
+- **The quant-benchmarking (`bench`) tooling from an earlier iteration of
+  this repo does not exist for the current model.** It was hardcoded to a
+  flat single-file quant-naming convention and was removed rather than
+  left half-working when this repo's model changed to one shipped as
+  sharded multi-file quants. If you want to benchmark alternate quants
+  for the current model, that tooling needs to be rebuilt to handle
+  per-quant shard sets, not just renamed.
 
 ## General: this whole stack is young
 
-llama.cpp's support for Qwen3.8's hybrid Gated-DeltaNet architecture only
-fully landed in the last few weeks before this repo was written, and is
-under active weekly bugfixing. Prefer `./serve-qwen38.sh update` regularly
+Mainline llama.cpp support for Laguna's architecture merged in mid-2026
+and is under active bugfixing. Prefer `./serve-laguna.sh update` regularly
 over pinning to an old build — but re-run `check` after every update, since
 a "latest master" isn't guaranteed stable either.

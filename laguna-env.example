@@ -1,0 +1,166 @@
+# Copy this file to laguna.env and edit as needed.
+# laguna.env is gitignored — it's your local, possibly-secret-bearing config.
+#
+# Every default below is chosen to mitigate a specific, currently-open
+# upstream llama.cpp bug on gfx1151 (Strix Halo), or a measured finding on
+# this exact box. See README.md "Known bugs" table and
+# docs/TROUBLESHOOTING.md before changing them.
+
+# --- Paths ---
+LLAMA_CPP_DIR="vendor/llama.cpp"
+MODEL_DIR="models"
+LOG_DIR="logs"
+SECRETS_DIR=".secrets"
+
+# --- ROCm ---
+# Leave unset to use the system default (/opt/rocm). Set this if you installed
+# a TheRock nightly tarball to a side-by-side prefix instead (see README §2b).
+#ROCM_PATH="/home/zebra/rocm-therock-nightly"
+GPU_TARGET="gfx1151"
+
+# --- Model source: Poolside Laguna S 2.1 (July 2026) ---
+#
+# 118B total / 8B active MoE. Conventional GQA + sliding-window attention —
+# confirmed by reading its `laguna.cpp` in this repo's own llama.cpp
+# checkout: built entirely from the same shared `build_attn`/`build_moe_ffn`
+# helpers dozens of other well-supported models use, no novel custom op
+# needed. That architectural choice is why this model avoids the class of
+# immature-kernel problems some other MoE/hybrid-attention models hit on
+# this hardware. Measured directly on this exact box: sustained ~26 tok/s
+# with NO speculative decoding at all (see "DFlash" note below). GPU
+# confirmed at 96-100% activity, ~97.6% of max clock, zero throttling
+# during generation, ~63-66W (vs. a ~2900MHz clock ceiling) — full
+# utilization at genuinely low power, not underutilization.
+#
+# Ships as 3 GGUF shards — MODEL_FILE is the first (llama.cpp
+# auto-detects the siblings by naming convention at load time),
+# MODEL_FILE_EXTRA_SHARDS lists the rest for `download` to fetch. No
+# mmproj (not multimodal) — MMPROJ_FILE intentionally left unset. Sizes
+# confirmed via HEAD request against the real files, not estimated.
+MODEL_REPO="unsloth/Laguna-S-2.1-GGUF"
+MODEL_FILE="UD-Q4_K_M/Laguna-S-2.1-UD-Q4_K_M-00001-of-00003.gguf"
+MODEL_FILE_EXTRA_SHARDS="UD-Q4_K_M/Laguna-S-2.1-UD-Q4_K_M-00002-of-00003.gguf,UD-Q4_K_M/Laguna-S-2.1-UD-Q4_K_M-00003-of-00003.gguf"
+MODEL_FILE_EXPECT_BYTES=3683648          # first shard only — tiny, mostly metadata; other two are ~49.9GB + ~23.2GB
+MMPROJ_FILE=""
+
+# DFlash speculative decoding (Poolside's own draft-model mechanism, ~2x+
+# claimed speedup) was tried and deliberately NOT adopted: reproducibly
+# hangs during draft-model memory measurement on Poolside's llama.cpp
+# fork (branch `laguna`) in this exact config — "dflash requires
+# ctx_other to be set" followed by a hang, not a clean failure. A real
+# bug in that fork, not a flag/config issue on our end (tested with and
+# without -fa). This model has no MTP-style "nextn" draft head either, so
+# there is currently no working speculative-decoding path — SPEC_TYPE is
+# empty below. If Poolside's fork is ever updated, it may be worth
+# retesting — see docs/TROUBLESHOOTING.md for the exact repro and retry
+# steps.
+SPEC_TYPE=""
+
+SERVED_MODEL_NAME="laguna-s-2.1"
+
+# --- Server ---
+HOST="0.0.0.0"
+PORT="8000"
+
+# SERVER_HOST: the address a CLIENT uses to reach this server — different
+# from HOST above (the bind address). Leave as 127.0.0.1 on the machine
+# that actually runs `build`/`serve`. On a client-only machine (e.g. a
+# laptop that only runs `wire-qwen-code`, cloned from this same repo),
+# set this to the server machine's LAN IP or hostname instead.
+SERVER_HOST="127.0.0.1"
+
+# CTX_SIZE: 131072, verified directly on this exact box 2026-09-19 —
+# loads and serves correctly at this context, ~76GB/80GB GTT used at load
+# time (~5.7GB headroom, a real but not huge safety margin). Laguna's
+# native context is 1,048,576, far beyond what's been tested here; treat
+# anything above 131072 as unverified. `serve` warns (does not block)
+# above 163840.
+#
+# CLIENT_CTX_SIZE/QWEN_SESSION_TOKEN_LIMIT below are scaled down from
+# CTX_SIZE proportionally, preserving layered-defense margins (soft
+# compaction trigger, then a hard backstop, both comfortably below the
+# real server limit).
+CTX_SIZE="131072"
+
+# CLIENT_CTX_SIZE: what we tell the qwen-code CLI harness via
+# generationConfig.contextWindowSize — deliberately LOWER than CTX_SIZE,
+# not equal to it. qwen-code's token counts are estimates (its own debug
+# log marks them `estimated=true`), and a single large step (e.g. one big
+# tool result) can jump past its compaction trigger before compaction
+# runs. Confirmed by hand: reporting the exact CTX_SIZE (an earlier,
+# smaller value) still overshot and hard-failed. Keep this comfortably
+# below CTX_SIZE — the gap is the safety margin. NOTE: even a 16K-token
+# margin was fully blown through in one turn (see QWEN_TOOL_OUTPUT_THRESHOLD
+# below for the fix that actually addresses the root cause, not just this
+# symptom).
+CLIENT_CTX_SIZE="98304"
+
+# QWEN_TOOL_OUTPUT_THRESHOLD / QWEN_TOOL_OUTPUT_LINES / QWEN_SESSION_TOKEN_LIMIT:
+# written into qwen-code's global settings.json (tools.truncateToolOutputThreshold/
+# Lines, model.sessionTokenLimit) by wire-qwen-code. Confirmed by hand: the
+# CLIENT_CTX_SIZE margin above got fully consumed in a single turn because
+# qwen-code's stock per-call tool-output truncation (25000 chars) still lets
+# a *batch* of several fanned-out tool calls add up to far more than that.
+# Lowering the per-call cap bounds how much a single turn can add; sessionTokenLimit
+# is a deterministic backstop that blocks sending the next message outright
+# once the recorded prompt is already over budget, independent of qwen-code's
+# (unreliable) token-count estimation. Requires a fresh `qwen` session to
+# take effect, not just a retry.
+QWEN_TOOL_OUTPUT_THRESHOLD="8000"
+QWEN_TOOL_OUTPUT_LINES="300"
+QWEN_SESSION_TOKEN_LIMIT="114688"
+
+# QWEN_CODE_MAX_OUTPUT_TOKENS: caps a single turn's generated tokens.
+# Without this, qwen-code defaults to the model's *declared* output limit —
+# effectively unbounded here. Confirmed by hand: a real turn generated
+# 12,000+ tokens at a healthy, stable pace (server logs show no
+# stall/corruption) and was still going when qwen-code's own 15-minute
+# stream-lifetime cap (QWEN_STREAM_MAX_LIFETIME_MS, default 900000ms)
+# killed the connection — discarding the entire in-flight response instead
+# of truncating cleanly. Hitting this cap instead gives a clean
+# `finish_reason: length` you can just ask to continue from.
+QWEN_CODE_MAX_OUTPUT_TOKENS="10000"
+
+# UBATCH_SIZE / BATCH_SIZE: 2048. Verified directly by hand 2026-09-19: a
+# needle-in-haystack test with a 4088-token prompt (well past 2048)
+# correctly retrieved an exact marker string, no corruption. Kept modest
+# deliberately — GPU compute-buffer memory scales with ubatch size
+# roughly independent of context length: at CTX_SIZE=131072, ubatch=8192
+# used 81.4GB/82GB GTT (446MB free — dangerously tight), while ubatch=2048
+# used only 77.2GB (4.7GB free) for the SAME context. If you ever see
+# garbled output on a much longer single prompt than tested here, raise
+# this and re-verify with the same kind of needle-in-haystack test rather
+# than assuming any given value is safe untested (see llama.cpp#28211).
+#
+# Keep BATCH_SIZE == UBATCH_SIZE so there's no second, smaller, invisible
+# chunk boundary below whichever ceiling is actually in effect.
+UBATCH_SIZE="2048"
+BATCH_SIZE="2048"
+
+# PARALLEL: mitigates lemonade-sdk#3160 (progressive generation corruption
+# under concurrent/sustained load on ROCm-nightly gfx1151, recovers only on
+# full reload). Single-slot serving is the safe default. If you raise this,
+# strongly consider `./serve-laguna.sh install-watchdog`.
+PARALLEL="1"
+
+GPU_LAYERS="999"        # full offload — unified memory, no VRAM ceiling
+FLASH_ATTN="auto"       # GGML_HIP_ROCWMMA_FATTN is compiled OFF (see build
+                         # flags in serve-laguna.sh) due to llama.cpp#24437,
+                         # so "auto" picks a safe generic kernel per layer.
+
+# SPEC_TYPE / SPEC_DRAFT_N_MAX: speculative decoding. SPEC_TYPE itself is
+# set once, up in the "Model source" section above (currently "" — no
+# working speculative-decoding path for this model; see that section for
+# why). SPEC_DRAFT_N_MAX only matters once SPEC_TYPE is non-empty (e.g. if
+# DFlash's fork bug gets fixed upstream).
+SPEC_DRAFT_N_MAX="4"
+
+# --- Security ---
+# Auto-generated on first `init` if this file is left blank; stored in
+# .secrets/api_key (chmod 600) and reused across runs.
+API_KEY=""
+
+# --- qwen-code CLI wiring ---
+# "user" -> ~/.qwen/.env   "project" -> $QWEN_PROJECT_DIR/.qwen/.env
+QWEN_ENV_TARGET="user"
+QWEN_PROJECT_DIR=""
